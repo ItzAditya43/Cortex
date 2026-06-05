@@ -1,0 +1,23 @@
+{
+  "stack": {
+    "frontend": "VS Code Extension (TypeScript + React)",
+    "backend": "FastAPI (Python)",
+    "database": "SQLite + ChromaDB",
+    "models": "Ollama"
+  },
+  "conventions": [
+    "TypeScript for extension/webview, Python for backend",
+    "Async/await for I/O operations",
+    "Pydantic models for API schemas",
+    "SSE streaming for completion endpoint"
+  ],
+  "important_files": [
+    "backend/src/main.py",
+    "backend/src/agent/runtime.py",
+    "backend/src/providers/ollama.py",
+    "extension/src/extension.ts",
+    "extension/src/agent/AgentController.ts",
+    "webview/src/App.tsx"
+  ],
+  "last_tasks": []
+}

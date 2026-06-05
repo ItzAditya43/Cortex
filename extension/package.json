@@ -1,0 +1,82 @@
+{
+  "name": "agent-os",
+  "displayName": "Agent OS",
+  "description": "Autonomous coding agent for VS Code",
+  "version": "0.1.0",
+  "publisher": "agent-os",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:agentOS.start",
+    "onCommand:agentOS.ask",
+    "onCommand:agentOS.toggleYolo"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentOS.start",
+        "title": "Agent OS: Start Agent Session"
+      },
+      {
+        "command": "agentOS.ask",
+        "title": "Agent OS: Ask Agent"
+      },
+      {
+        "command": "agentOS.toggleYolo",
+        "title": "Agent OS: Toggle YOLO Mode"
+      }
+    ],
+    "configuration": {
+      "title": "Agent OS",
+      "properties": {
+        "agentOS.backendUrl": {
+          "type": "string",
+          "default": "http://localhost:8080",
+          "description": "FastAPI backend URL"
+        },
+        "agentOS.provider": {
+          "type": "string",
+          "default": "ollama",
+          "enum": ["ollama", "openrouter", "gemini"],
+          "description": "Default model provider"
+        },
+        "agentOS.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model name override (empty = provider default)"
+        },
+        "agentOS.yoloMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Auto-approve all tool calls"
+        },
+        "agentOS.autoIndex": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-index project files on session start"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile && cd ../webview && npm run build",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.11",
+    "typescript": "^5.3.3",
+    "vitest": "^1.2.0"
+  }
+}

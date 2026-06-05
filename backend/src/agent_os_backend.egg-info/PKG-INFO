@@ -1,0 +1,22 @@
+Metadata-Version: 2.4
+Name: agent-os-backend
+Version: 0.1.0
+Summary: Agent OS - Autonomous Coding Agent Backend
+Requires-Python: >=3.11
+Requires-Dist: fastapi>=0.109
+Requires-Dist: uvicorn[standard]>=0.27
+Requires-Dist: pydantic>=2.5
+Requires-Dist: pydantic-settings>=2.1
+Requires-Dist: sqlalchemy>=2.0
+Requires-Dist: aiosqlite>=0.20
+Requires-Dist: alembic>=1.13
+Requires-Dist: chromadb>=0.4
+Requires-Dist: sentence-transformers>=2.2
+Requires-Dist: litellm>=1.10
+Requires-Dist: httpx>=0.26
+Requires-Dist: sse-starlette>=1.8
+Requires-Dist: python-multipart>=0.0.6
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
+Requires-Dist: pytest-cov>=4.1; extra == "dev"
