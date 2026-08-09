@@ -131,7 +131,12 @@
     const div = document.createElement('div');
     div.className = 'empty-state';
     div.innerHTML = `
-      <div class="empty-glyph"></div>
+      <div class="empty-glyph">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <ellipse cx="8" cy="12" rx="5.5" ry="4.7"></ellipse>
+          <ellipse cx="16" cy="12" rx="5.5" ry="4.7"></ellipse>
+        </svg>
+      </div>
       <div class="empty-title">Ask Cortex anything</div>
       <div class="empty-sub">It can read, write, and run code in this workspace. Try "list the files here" to start.</div>
     `;
