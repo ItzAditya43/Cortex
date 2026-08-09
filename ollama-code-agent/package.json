@@ -1,0 +1,144 @@
+{
+  "name": "cortex",
+  "displayName": "Cortex",
+  "description": "A local, private coding agent for VS Code — like Cline, but powered entirely by your own Ollama models. No API keys, no cloud.",
+  "version": "0.1.0",
+  "publisher": "cortex",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/extension.cjs",
+  "icon": "media/icon.png",
+  "engines": {
+    "vscode": "^1.85.0",
+    "node": ">=18"
+  },
+  "categories": [
+    "Machine Learning",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "ollama",
+    "ai",
+    "agent",
+    "cline",
+    "local llm",
+    "coding assistant",
+    "chat"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cortex/cortex"
+  },
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "cortex",
+          "title": "Cortex",
+          "icon": "media/activitybar.svg"
+        }
+      ]
+    },
+    "views": {
+      "cortex": [
+        {
+          "type": "webview",
+          "id": "cortex.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "cortex.newChat",
+        "title": "New Chat",
+        "category": "Cortex",
+        "icon": "$(add)"
+      },
+      {
+        "command": "cortex.selectModel",
+        "title": "Select Model",
+        "category": "Cortex",
+        "icon": "$(list-selection)"
+      },
+      {
+        "command": "cortex.openChat",
+        "title": "Open Chat",
+        "category": "Cortex"
+      },
+      {
+        "command": "cortex.toggleAutoApprove",
+        "title": "Toggle Auto-Approve",
+        "category": "Cortex"
+      },
+      {
+        "command": "cortex.showLogs",
+        "title": "Show Logs",
+        "category": "Cortex"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "cortex.newChat",
+          "when": "view == cortex.chatView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "cortex.selectModel",
+          "when": "view == cortex.chatView",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Cortex",
+      "properties": {
+        "cortex.host": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Base URL of your local (or remote) Ollama server."
+        },
+        "cortex.model": {
+          "type": "string",
+          "default": "qwen2.5-coder:3b",
+          "description": "Ollama model to use for the agent — must exactly match a locally pulled model name/tag (see `ollama list`)."
+        },
+        "cortex.autoApprove": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically approve file writes/edits and shell commands without asking for confirmation. Use with caution."
+        },
+        "cortex.temperature": {
+          "type": "number",
+          "default": 0.2,
+          "description": "Sampling temperature passed to the model."
+        },
+        "cortex.maxSteps": {
+          "type": "number",
+          "default": 25,
+          "description": "Maximum number of tool-call steps the agent may take per request before stopping."
+        },
+        "cortex.contextBudgetTokens": {
+          "type": "number",
+          "default": 6000,
+          "description": "Rough token budget for conversation history sent to the model each turn (chars/4 heuristic, no tokenizer dependency). Lower this for small-context-window models; when exceeded, the oldest messages are dropped and the model is told so explicitly rather than silently losing context."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "vsce package --no-dependencies",
+    "publish": "vsce publish --no-dependencies",
+    "test": "node --test test/**/*.test.cjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.32.0",
+    "typescript": "^5.9.3"
+  }
+}

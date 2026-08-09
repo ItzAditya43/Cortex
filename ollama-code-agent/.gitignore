@@ -1,0 +1,6 @@
+node_modules/
+.ollama-agent/
+.cortex/
+*.log
+*.vsix
+out/

@@ -1,0 +1,10 @@
+.vscode/**
+.github/**
+test/**
+.ollama-agent/**
+.cortex/**
+*.vsix
+**/*.map
+.gitignore
+.eslintrc*
+tsconfig.json
