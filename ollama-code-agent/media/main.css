@@ -107,28 +107,23 @@ body {
 
 #history-btn, #approvals-btn, #memory-btn {
   border: none;
+  background: transparent;
+  color: var(--vscode-foreground);
   cursor: pointer;
-  font-size: 13px;
   width: 26px;
   height: 26px;
-  border-radius: 50%;
+  border-radius: var(--cortex-radius-sm);
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
-  transition: transform 0.12s ease, filter 0.12s ease;
+  opacity: 0.75;
+  transition: opacity 0.12s ease, background 0.12s ease;
 }
 #history-btn:hover, #approvals-btn:hover, #memory-btn:hover {
-  transform: scale(1.06);
-  filter: brightness(1.1);
+  opacity: 1;
+  background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15));
 }
-#history-btn:active, #approvals-btn:active, #memory-btn:active {
-  transform: scale(0.96);
-}
-
-#memory-btn { background: linear-gradient(135deg, #f472b6, #a855f7); }
-#history-btn { background: linear-gradient(135deg, #38bdf8, #3b82f6); }
-#approvals-btn { background: linear-gradient(135deg, #94a3b8, #64748b); }
 
 /* ---------- panels ---------- */
 .panel {

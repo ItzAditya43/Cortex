@@ -26,7 +26,7 @@ const MUTATING_TOOLS = Object.entries(tools)
 // as plain vector paths rather than emoji so they render consistently
 // (weight, color, alignment) across OSes instead of relying on the
 // platform's emoji font.
-const ICON_SVG_ATTRS = 'width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
+const ICON_SVG_ATTRS = 'width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
 const ICON_MEMORY = `<svg ${ICON_SVG_ATTRS}><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>`;
 const ICON_HISTORY = `<svg ${ICON_SVG_ATTRS}><circle cx="12" cy="12" r="9"></circle><polyline points="12 7 12 12 16 14"></polyline></svg>`;
 const ICON_APPROVALS = `<svg ${ICON_SVG_ATTRS}><polyline points="8 11 11 14 17 6"></polyline><path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"></path></svg>`;
