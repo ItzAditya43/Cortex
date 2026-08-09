@@ -1,6 +1,0 @@
-agent
-db
-memory
-providers
-router
-tools
