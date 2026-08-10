@@ -1,6 +1,22 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const { toolListForPrompt } = require('./tools.cjs');
+
+// Project-local conventions file, analogous to Cline's .clinerules — lets a
+// repo pin coding standards/architecture notes that apply regardless of
+// which session or model is driving the agent.
+function loadProjectRules(cwd) {
+  if (!cwd) return '';
+  const f = path.join(cwd, '.cortexrules');
+  if (!fs.existsSync(f)) return '';
+  try {
+    return fs.readFileSync(f, 'utf8').trim();
+  } catch {
+    return '';
+  }
+}
 
 // Tool-calling is implemented via a strict text protocol instead of Ollama's
 // native "tools" field, because native function calling is only reliable on
@@ -34,7 +50,8 @@ Guidelines:
 - One tool call per response. Don't try to do multiple steps at once.
 - If a request is ambiguous, make the most reasonable assumption and proceed rather than stalling — only ask the user a question (as a final plain-text answer, no tool call) if you genuinely cannot proceed without more information.
 - Be thorough while working, but concise in your final summary to the user.
-${memoryNotes ? `\nLong-term memory notes from previous sessions in this workspace:\n${memoryNotes}` : ''}`;
+${memoryNotes ? `\nLong-term memory notes from previous sessions in this workspace:\n${memoryNotes}` : ''}
+${loadProjectRules(cwd) ? `\nProject rules (from .cortexrules — follow these strictly):\n${loadProjectRules(cwd)}` : ''}`;
 }
 
-module.exports = { buildSystemPrompt };
+module.exports = { buildSystemPrompt, loadProjectRules };

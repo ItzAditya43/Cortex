@@ -2,13 +2,46 @@
 
 const vscode = require('vscode');
 const { ChatViewProvider, DiffContentProvider } = require('./chatViewProvider.cjs');
-const { listModels } = require('./ollamaClient.cjs');
+const { listModels } = require('./provider.cjs');
+const { startScheduler, stopScheduler } = require('./scheduler.cjs');
+const { startMcpServers, stopMcpServers } = require('./mcpManager.cjs');
 const logger = require('./logger.cjs');
 
 function activate(context) {
   logger.init();
   logger.log('Cortex activated.');
-  context.subscriptions.push({ dispose: () => logger.log('Cortex deactivating.') });
+  context.subscriptions.push({
+    dispose: () => {
+      logger.log('Cortex deactivating.');
+      stopMcpServers();
+      stopScheduler();
+    },
+  });
+
+  const initialCfg = vscode.workspace.getConfiguration('cortex');
+  startMcpServers(initialCfg.get('mcpServers') || [], (m) => logger.log(m));
+  startScheduler({
+    getSchedules: () => vscode.workspace.getConfiguration('cortex').get('schedules') || [],
+    getRunConfig: () => {
+      const c = vscode.workspace.getConfiguration('cortex');
+      return {
+        host: c.get('host'),
+        provider: c.get('provider') || 'ollama',
+        apiKey: c.get('apiKey') || '',
+        model: c.get('model'),
+        temperature: c.get('temperature'),
+        maxSteps: c.get('maxSteps'),
+        contextBudgetTokens: c.get('contextBudgetTokens'),
+      };
+    },
+    getRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
+    onResult: (schedule, text) => {
+      logger.log(`schedule "${schedule.name}" finished: ${text.slice(0, 200)}`);
+      vscode.window.showInformationMessage(`Cortex schedule "${schedule.name}" finished — see logs for details.`);
+    },
+    onError: (schedule, message) => logger.log(`schedule "${schedule.name}" error: ${message}`),
+    logFn: (m) => logger.log(m),
+  });
 
   const diffProvider = new DiffContentProvider();
   context.subscriptions.push(
@@ -38,6 +71,10 @@ function activate(context) {
       if (e.affectsConfiguration('cortex.model')) refreshStatusBar();
       if (e.affectsConfiguration('cortex.model') || e.affectsConfiguration('cortex.autoApprove')) {
         provider.post({ type: 'config', ...provider.cfg() });
+      }
+      if (e.affectsConfiguration('cortex.mcpServers')) {
+        const c = vscode.workspace.getConfiguration('cortex');
+        startMcpServers(c.get('mcpServers') || [], (m) => logger.log(m));
       }
     })
   );
@@ -71,12 +108,20 @@ function activate(context) {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('cortex.revertLastTurn', async () => {
+      await provider.revertLastTurn();
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('cortex.selectModel', async () => {
       const c = vscode.workspace.getConfiguration('cortex');
       const host = c.get('host');
+      const provider = c.get('provider') || 'ollama';
+      const apiKey = c.get('apiKey') || '';
       let models;
       try {
-        models = await listModels({ host });
+        models = await listModels({ host, provider, apiKey });
       } catch (err) {
         const typed = await vscode.window.showInputBox({
           prompt: `Could not list models from ${host} (${err.message}). Enter a model name manually:`,

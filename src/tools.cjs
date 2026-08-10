@@ -10,10 +10,18 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execSync, spawn } = require('child_process');
 const { appendMemoryNote } = require('./memory.cjs');
+const { indexNote } = require('./semanticMemory.cjs');
 
 const MAX_RESULT_CHARS = 8000;
+
+// Long-running background processes (dev servers, watchers) started via
+// run_background, keyed by an id handed back to the model so it can poll
+// output or stop them later. Module-level because a single extension host
+// process serves one workspace at a time.
+const backgroundProcs = new Map(); // id -> {proc, output: string[], exitCode: number|null}
+let backgroundIdCounter = 0;
 
 function truncate(s) {
   if (typeof s !== 'string') s = String(s);
@@ -141,10 +149,195 @@ const tools = {
   remember: {
     description: 'Save a short, durable note to long-term memory for future sessions (e.g. project conventions, decisions made). Arguments: {"note": string}',
     confirm: false,
-    run: ({ note }, root) => {
+    run: ({ note }, root, ctx) => {
       if (!note) return 'ERROR: note is required';
       appendMemoryNote(root, note);
+      // Fire-and-forget: indexing for semantic recall shouldn't block the
+      // agent loop or fail the tool call if the embedding model is unavailable.
+      if (ctx?.host) indexNote(root, ctx.host, note).catch(() => {});
       return 'OK: saved to long-term memory';
+    },
+  },
+
+  run_background: {
+    description:
+      'Start a long-running shell command (dev server, watcher, build --watch) in the background and return an id immediately instead of blocking. Use read_background_output to poll its output and stop_background_process to kill it. Arguments: {"command": string}',
+    confirm: true,
+    run: ({ command }, root) => {
+      if (!command) return 'ERROR: command is required';
+      const id = `bg${++backgroundIdCounter}`;
+      const proc = spawn(command, { cwd: root, shell: true });
+      const entry = { proc, output: [], exitCode: null };
+      backgroundProcs.set(id, entry);
+      proc.stdout.on('data', (d) => entry.output.push(d.toString()));
+      proc.stderr.on('data', (d) => entry.output.push(d.toString()));
+      proc.on('exit', (code) => {
+        entry.exitCode = code;
+      });
+      return `OK: started background process ${id} (pid ${proc.pid}). Use read_background_output {"id":"${id}"} to check on it.`;
+    },
+  },
+
+  read_background_output: {
+    description: 'Read accumulated stdout/stderr from a process started with run_background, and whether it has exited. Arguments: {"id": string}',
+    confirm: false,
+    run: ({ id }) => {
+      const entry = backgroundProcs.get(id);
+      if (!entry) return `ERROR: no background process with id ${id}`;
+      const out = entry.output.join('');
+      const status = entry.exitCode === null ? 'still running' : `exited with code ${entry.exitCode}`;
+      return truncate(`status: ${status}\n\n${out || '(no output yet)'}`);
+    },
+  },
+
+  stop_background_process: {
+    description: 'Kill a background process started with run_background. Arguments: {"id": string}',
+    confirm: true,
+    run: ({ id }) => {
+      const entry = backgroundProcs.get(id);
+      if (!entry) return `ERROR: no background process with id ${id}`;
+      if (entry.exitCode !== null) return `OK: process ${id} had already exited (code ${entry.exitCode})`;
+      entry.proc.kill();
+      return `OK: sent kill signal to ${id}`;
+    },
+  },
+
+  delegate_task: {
+    description:
+      'Delegate a self-contained sub-task to a fresh sub-agent (its own context window, same tools except delegate_task itself) and get back its final answer. Use for well-scoped chunks of a larger task (e.g. "write tests for utils.js") to keep your own context focused. Arguments: {"task": string}',
+    confirm: false,
+    run: async ({ task }, root, ctx) => {
+      if (!task) return 'ERROR: task is required';
+      if (!ctx || !ctx.delegateConfig) return 'ERROR: delegation is not available in this context';
+      const depth = ctx.delegateDepth || 0;
+      if (depth >= 1) return 'ERROR: sub-agents cannot delegate further (depth limit reached). Do the task directly instead.';
+      // Lazy require: agentLoop.cjs requires this module at load time, so a
+      // top-level require here would deadlock on the circular import.
+      const { runTurn } = require('./agentLoop.cjs');
+      const subHistory = [{ role: 'user', content: task }];
+      let finalText = null;
+      let errorText = null;
+      await runTurn({
+        history: subHistory,
+        root,
+        host: ctx.delegateConfig.host,
+        provider: ctx.delegateConfig.provider,
+        apiKey: ctx.delegateConfig.apiKey,
+        model: ctx.delegateConfig.model,
+        temperature: ctx.delegateConfig.temperature,
+        maxSteps: Math.min(ctx.delegateConfig.maxSteps, 15),
+        memoryNotes: '',
+        planMode: false,
+        contextBudgetTokens: ctx.delegateConfig.contextBudgetTokens,
+        ctx: { ...ctx, delegateDepth: depth + 1 },
+        onToken: () => {},
+        onToolCall: (name, args, callId) => ctx.onSubTaskEvent?.('toolCall', { name, args, callId }),
+        requestApproval: async () => true, // sub-agents run fully autonomously within the same trust boundary as the parent call
+        onToolResult: (result, isError, callId) => ctx.onSubTaskEvent?.('toolResult', { result, isError, callId }),
+        onFinal: (text) => {
+          finalText = text;
+        },
+        onError: (msg) => {
+          errorText = msg;
+        },
+      });
+      if (errorText) return `ERROR from sub-agent: ${errorText}`;
+      return `Sub-agent result:\n${finalText || '(sub-agent produced no final answer)'}`;
+    },
+  },
+
+  delete_file: {
+    description: 'Delete a file (not a directory). Arguments: {"path": string}',
+    confirm: true,
+    preview: ({ path: p }, root) => {
+      const full = safePath(root, p);
+      const before = fs.existsSync(full) && !fs.statSync(full).isDirectory() ? fs.readFileSync(full, 'utf8') : '';
+      return { path: p, before, after: '' };
+    },
+    run: ({ path: p }, root) => {
+      const full = safePath(root, p);
+      if (!fs.existsSync(full)) return `ERROR: file not found: ${p}`;
+      if (fs.statSync(full).isDirectory()) return `ERROR: ${p} is a directory, refusing to delete_file it`;
+      fs.unlinkSync(full);
+      return `OK: deleted ${p}`;
+    },
+  },
+
+  rename_file: {
+    description: 'Rename or move a file to a new path within the workspace. Arguments: {"from": string, "to": string}',
+    confirm: true,
+    preview: ({ from, to }, root) => {
+      const full = safePath(root, from);
+      const before = fs.existsSync(full) ? fs.readFileSync(full, 'utf8') : '';
+      return { path: `${from} -> ${to}`, before, after: before };
+    },
+    run: ({ from, to }, root) => {
+      const fullFrom = safePath(root, from);
+      const fullTo = safePath(root, to);
+      if (!fs.existsSync(fullFrom)) return `ERROR: file not found: ${from}`;
+      fs.mkdirSync(path.dirname(fullTo), { recursive: true });
+      fs.renameSync(fullFrom, fullTo);
+      return `OK: renamed ${from} -> ${to}`;
+    },
+  },
+
+  read_url: {
+    description: 'Fetch a URL over HTTP(S) and return its text content (HTML tags stripped for readability). Arguments: {"url": string}',
+    confirm: false,
+    run: async ({ url }) => {
+      if (!url) return 'ERROR: url is required';
+      let parsed;
+      try {
+        parsed = new URL(url);
+      } catch {
+        return `ERROR: invalid url: ${url}`;
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return `ERROR: only http/https urls are allowed`;
+      }
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+        const contentType = res.headers.get('content-type') || '';
+        const raw = await res.text();
+        let text = raw;
+        if (contentType.includes('html')) {
+          text = raw
+            .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+            .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+            .replace(/<[^>]+>/g, ' ')
+            .replace(/&nbsp;/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+        }
+        return truncate(`HTTP ${res.status} ${contentType}\n\n${text}`);
+      } catch (err) {
+        return `ERROR fetching ${url}: ${err.message}`;
+      }
+    },
+  },
+
+  notify_webhook: {
+    description:
+      'Send a short notification message to the configured Slack/Discord/generic webhook (set via the "cortex.webhookUrl" setting). Use sparingly, e.g. to flag a long task finished or a decision needs human input. Arguments: {"message": string}',
+    confirm: true,
+    run: async ({ message }, root, ctx) => {
+      const webhookUrl = ctx?.webhookUrl;
+      if (!webhookUrl) return 'ERROR: no webhook configured. Set "cortex.webhookUrl" in settings first.';
+      if (!message) return 'ERROR: message is required';
+      try {
+        const isDiscord = webhookUrl.includes('discord.com');
+        const body = isDiscord ? { content: message } : { text: message };
+        const res = await fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!res.ok) return `ERROR: webhook returned HTTP ${res.status}`;
+        return 'OK: notification sent';
+      } catch (err) {
+        return `ERROR sending webhook: ${err.message}`;
+      }
     },
   },
 };
@@ -153,4 +346,16 @@ function toolListForPrompt() {
   return Object.entries(tools).map(([name, t]) => `- ${name}: ${t.description}`).join('\n');
 }
 
-module.exports = { tools, toolListForPrompt, safePath };
+// Lets external integrations (currently: mcpManager.cjs) add/remove tools
+// into the same registry the agent loop already reads from, so MCP-provided
+// tools show up in the system prompt and go through the normal
+// confirm/preview/approval pipeline like any built-in tool.
+function registerExternalTool(name, toolDef) {
+  tools[name] = toolDef;
+}
+
+function unregisterExternalTool(name) {
+  delete tools[name];
+}
+
+module.exports = { tools, toolListForPrompt, safePath, registerExternalTool, unregisterExternalTool };

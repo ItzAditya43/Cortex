@@ -7,6 +7,9 @@
   "license": "MIT",
   "type": "module",
   "main": "./src/extension.cjs",
+  "bin": {
+    "cortex-cli": "./bin/cortex-cli.cjs"
+  },
   "icon": "media/icon.png",
   "engines": {
     "vscode": "^1.85.0",
@@ -77,6 +80,11 @@
         "command": "cortex.showLogs",
         "title": "Show Logs",
         "category": "Cortex"
+      },
+      {
+        "command": "cortex.revertLastTurn",
+        "title": "Revert Last Turn (all files)",
+        "category": "Cortex"
       }
     ],
     "menus": {
@@ -110,6 +118,58 @@
           "type": "boolean",
           "default": false,
           "description": "Automatically approve file writes/edits and shell commands without asking for confirmation. Use with caution."
+        },
+        "cortex.autoApproveCommands": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Command prefixes (e.g. \"npm test\", \"git status\") that run_command may execute without confirmation, even when cortex.autoApprove is off. A command is allowed if it starts with one of these prefixes."
+        },
+        "cortex.provider": {
+          "type": "string",
+          "enum": ["ollama", "openai-compatible"],
+          "default": "ollama",
+          "description": "Which backend to send chat requests to. \"openai-compatible\" works with OpenAI itself, OpenRouter, LM Studio, vLLM, or any server exposing /v1/chat/completions."
+        },
+        "cortex.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key sent as a Bearer token when cortex.provider is \"openai-compatible\". Not used for Ollama."
+        },
+        "cortex.webhookUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Slack or Discord incoming-webhook URL the agent's notify_webhook tool can post short status updates to."
+        },
+        "cortex.mcpServers": {
+          "type": "array",
+          "default": [],
+          "description": "MCP (Model Context Protocol) servers to connect to at startup. Each server's tools are added to the agent's toolset, prefixed \"mcp_<name>_\".",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "command": { "type": "string" },
+              "args": { "type": "array", "items": { "type": "string" } },
+              "env": { "type": "object" }
+            },
+            "required": ["name", "command"]
+          }
+        },
+        "cortex.schedules": {
+          "type": "array",
+          "default": [],
+          "description": "Cron-based recurring agent runs (e.g. daily TODO summaries, dependency checks). Runs unattended in read-only Plan Mode unless autoApprove is set on the schedule.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "cron": { "type": "string", "description": "Standard 5-field cron expression, e.g. \"0 9 * * 1-5\"." },
+              "prompt": { "type": "string" },
+              "autoApprove": { "type": "boolean", "default": false }
+            },
+            "required": ["cron", "prompt"]
+          }
         },
         "cortex.temperature": {
           "type": "number",

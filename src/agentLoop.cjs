@@ -6,7 +6,7 @@
 'use strict';
 
 const crypto = require('crypto');
-const { chat } = require('./ollamaClient.cjs');
+const { chat } = require('./provider.cjs');
 const { tools } = require('./tools.cjs');
 const { buildSystemPrompt } = require('./systemPrompt.cjs');
 const { buildContextMessages, DEFAULT_BUDGET_TOKENS } = require('./contextManager.cjs');
@@ -105,6 +105,7 @@ function parseToolCall(text) {
  * @param {string} [opts.openFile]
  * @param {boolean} [opts.planMode]       when true, mutating tools (write_file/edit_file/run_command) are blocked
  * @param {number} [opts.contextBudgetTokens] rough token budget for history sent per turn (see contextManager.cjs)
+ * @param {object} [opts.ctx]            passed through as tool.run's 3rd argument (webhook url, delegation config, etc.)
  * @param {AbortSignal} [opts.signal]
  * @param {(token: string) => void} opts.onToken           streamed assistant text
  * @param {(name: string, args: object, callId: string) => void} opts.onToolCall
@@ -119,6 +120,8 @@ async function runTurn(opts) {
     history,
     root,
     host,
+    provider,
+    apiKey,
     model,
     temperature,
     maxSteps,
@@ -126,6 +129,7 @@ async function runTurn(opts) {
     openFile,
     planMode,
     contextBudgetTokens = DEFAULT_BUDGET_TOKENS,
+    ctx,
     signal,
     onToken,
     onToolCall,
@@ -148,7 +152,7 @@ async function runTurn(opts) {
 
     let reply;
     try {
-      reply = await chat({ host, model, messages, temperature, signal, onToken, logFn: onLog });
+      reply = await chat({ host, provider, apiKey, model, messages, temperature, signal, onToken, logFn: onLog });
     } catch (err) {
       if (err.name === 'AbortError') return;
       onLog?.(`step ${steps}: error — ${err.message}`);
@@ -221,7 +225,7 @@ async function runTurn(opts) {
     let result;
     let isError = false;
     try {
-      result = tool.run(args, root);
+      result = await tool.run(args, root, ctx);
       isError = typeof result === 'string' && result.startsWith('ERROR');
     } catch (err) {
       result = `ERROR running tool: ${err.message}`;

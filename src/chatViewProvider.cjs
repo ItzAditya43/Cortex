@@ -14,8 +14,9 @@ const {
   listSessions,
   deleteSession,
 } = require('./memory.cjs');
-const { listModels } = require('./ollamaClient.cjs');
+const { listModels } = require('./provider.cjs');
 const { shouldAutoApprove } = require('./permissions.cjs');
+const { retrieveRelevantNotes } = require('./semanticMemory.cjs');
 const logger = require('./logger.cjs');
 
 const MUTATING_TOOLS = Object.entries(tools)
@@ -96,10 +97,14 @@ class ChatViewProvider {
     return {
       host: c.get('host'),
       model: c.get('model'),
+      provider: c.get('provider') || 'ollama',
+      apiKey: c.get('apiKey') || '',
       autoApprove: c.get('autoApprove'),
+      autoApproveCommands: c.get('autoApproveCommands') || [],
       temperature: c.get('temperature'),
       maxSteps: c.get('maxSteps'),
       contextBudgetTokens: c.get('contextBudgetTokens'),
+      webhookUrl: c.get('webhookUrl') || '',
     };
   }
 
@@ -257,6 +262,9 @@ class ChatViewProvider {
       case 'revert':
         await this.revertChange(msg.id);
         break;
+      case 'revertTurn':
+        await this.revertLastTurn();
+        break;
       case 'openExternal':
         if (msg.url) vscode.env.openExternal(vscode.Uri.parse(msg.url));
         break;
@@ -287,6 +295,7 @@ class ChatViewProvider {
     this.history = [];
     this.revertable.clear();
     this.diffShownFor.clear();
+    this.checkpoints = [];
     this.post({ type: 'cleared' });
   }
 
@@ -361,18 +370,29 @@ class ChatViewProvider {
     logger.log(
       `session=${this.sessionId} mode=${this.mode} model=${cfg.model} user message (${text.length} chars): ${text.slice(0, 120)}`
     );
-    const memoryNotes = loadMemoryNotes(root);
+    let memoryNotes = loadMemoryNotes(root);
+    if (cfg.provider !== 'openai-compatible') {
+      try {
+        const relevant = await retrieveRelevantNotes(root, cfg.host, text, 8);
+        if (relevant) memoryNotes = relevant;
+      } catch {
+        // fall back to the full flat notes already loaded above
+      }
+    }
     const openFile = vscode.window.activeTextEditor
       ? vscode.workspace.asRelativePath(vscode.window.activeTextEditor.document.uri)
       : undefined;
     const planMode = this.mode === 'plan';
     const startedAt = Date.now();
+    const turnCallIds = [];
 
     try {
       await runTurn({
         history: this.history,
         root,
         host: cfg.host,
+        provider: cfg.provider,
+        apiKey: cfg.apiKey,
         model: cfg.model,
         temperature: cfg.temperature,
         maxSteps: cfg.maxSteps,
@@ -381,6 +401,20 @@ class ChatViewProvider {
         openFile,
         planMode,
         signal: this.abortController.signal,
+        ctx: {
+          host: cfg.host,
+          webhookUrl: cfg.webhookUrl,
+          delegateConfig: {
+            host: cfg.host,
+            provider: cfg.provider,
+            apiKey: cfg.apiKey,
+            model: cfg.model,
+            temperature: cfg.temperature,
+            maxSteps: cfg.maxSteps,
+            contextBudgetTokens: cfg.contextBudgetTokens,
+          },
+          onSubTaskEvent: (kind, payload) => this.post({ type: `subTask${kind === 'toolCall' ? 'Call' : 'Result'}`, ...payload }),
+        },
         onLog: (message) => logger.log(message),
         onToken: (t) => {
           this.post({ type: 'token', text: t });
@@ -389,11 +423,22 @@ class ChatViewProvider {
           this.post({ type: 'toolCall', name, args, id: callId });
         },
         requestApproval: async (name, args, callId) => {
-          if (shouldAutoApprove(name, { autoApprove: cfg.autoApprove, autoApproveTools: this.autoApproveTools })) return true;
+          if (
+            shouldAutoApprove(name, {
+              autoApprove: cfg.autoApprove,
+              autoApproveTools: this.autoApproveTools,
+              autoApproveCommands: cfg.autoApproveCommands,
+              commandArg: name === 'run_command' ? args.command : undefined,
+            })
+          )
+            return true;
           return this.requestApproval(name, args, callId);
         },
         onToolResult: (result, isError, callId, snapshot) => {
-          if (snapshot && callId) this.revertable.set(callId, snapshot);
+          if (snapshot && callId) {
+            this.revertable.set(callId, snapshot);
+            turnCallIds.push(callId);
+          }
           const alreadyShown = callId && this.diffShownFor.has(callId);
           this.post({
             type: 'toolResult',
@@ -414,12 +459,45 @@ class ChatViewProvider {
     } catch (err) {
       this.post({ type: 'error', text: err.message });
     } finally {
+      if (turnCallIds.length > 0) {
+        this.checkpoints = this.checkpoints || [];
+        this.checkpoints.push({ id: nonce().slice(0, 8), callIds: turnCallIds, at: Date.now() });
+        this.post({ type: 'checkpointCreated', callIds: turnCallIds, count: turnCallIds.length });
+      }
       saveHistory(root, this.sessionId, this.history);
       touchSession(root, this.sessionId, this.history);
       this.busy = false;
       this.abortController = null;
       this.post({ type: 'busy', value: false });
     }
+  }
+
+  // Reverts every file change made during the most recent turn (not just one
+  // file), applying snapshots in reverse order so earlier writes to the same
+  // path aren't clobbered by a later one still marked "revertable".
+  async revertLastTurn() {
+    const root = this.root;
+    if (!root || !this.checkpoints || this.checkpoints.length === 0) return;
+    const cp = this.checkpoints.pop();
+    const seen = new Set();
+    for (let i = cp.callIds.length - 1; i >= 0; i--) {
+      const callId = cp.callIds[i];
+      const snapshot = this.revertable.get(callId);
+      if (!snapshot || seen.has(snapshot.path)) continue;
+      seen.add(snapshot.path);
+      try {
+        tools.write_file.run({ path: snapshot.path, content: snapshot.before }, root);
+        this.revertable.delete(callId);
+      } catch (err) {
+        this.post({ type: 'error', text: `Revert failed for ${snapshot.path}: ${err.message}` });
+      }
+    }
+    this.history.push({
+      role: 'user',
+      content: `TOOL_RESULT: SYSTEM NOTE — the user reverted your entire last turn (${seen.size} file(s) restored). Take this into account if you continue working.`,
+    });
+    saveHistory(root, this.sessionId, this.history);
+    this.post({ type: 'turnReverted', paths: [...seen] });
   }
 }
 
