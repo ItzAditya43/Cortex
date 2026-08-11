@@ -210,6 +210,16 @@ async function runTurn(opts) {
       continue;
     }
 
+    // read-only sandbox mode is a hard block, independent of approval policy
+    // — matches Codex CLI: sandboxMode decides what's even possible, approvalPolicy
+    // decides what's asked about within that.
+    if (ctx?.sandboxMode === 'read-only' && (tool.kind === 'edit' || tool.kind === 'command')) {
+      const msg = `ERROR: the "${toolCall.name}" tool is disabled — sandbox mode is "read-only". Investigate and report back instead of making changes.`;
+      history.push({ role: 'user', content: `TOOL_RESULT: ${msg}` });
+      onToolResult(msg, true, callId);
+      continue;
+    }
+
     if (tool.confirm) {
       const approved = await requestApproval(toolCall.name, args, callId);
       if (!approved) {

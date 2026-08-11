@@ -144,7 +144,7 @@ const tools = {
     kind: 'command',
     run: ({ command }, root, ctx) => {
       if (!command) return 'ERROR: command is required';
-      const { command: toRun, sandboxed } = ctx?.sandboxCommands
+      const { command: toRun, sandboxed } = ctx?.sandboxMode === 'workspace-write'
         ? wrapCommand(command, root, { allowNetwork: !!ctx.sandboxAllowNetwork })
         : { command, sandboxed: false };
       try {
@@ -179,7 +179,7 @@ const tools = {
     run: ({ command }, root, ctx) => {
       if (!command) return 'ERROR: command is required';
       const id = `bg${++backgroundIdCounter}`;
-      const { command: toRun, sandboxed } = ctx?.sandboxCommands
+      const { command: toRun, sandboxed } = ctx?.sandboxMode === 'workspace-write'
         ? wrapCommand(command, root, { allowNetwork: !!ctx.sandboxAllowNetwork })
         : { command, sandboxed: false };
       const proc = spawn(toRun, { cwd: root, shell: true });

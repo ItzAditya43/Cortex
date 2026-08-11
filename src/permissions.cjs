@@ -5,6 +5,16 @@
 
 'use strict';
 
+// Legacy names (this project's own first pass, and Codex CLI's pre-0.147
+// suggest/auto-edit/full-auto model, since removed upstream in favor of the
+// two-axis approvalPolicy + sandboxMode split below) still map onto the
+// current policy so existing user settings keep working.
+const LEGACY_APPROVAL_ALIASES = { suggest: 'untrusted', 'auto-edit': 'on-request', 'full-auto': 'never' };
+
+function normalizeApprovalPolicy(p) {
+  return LEGACY_APPROVAL_ALIASES[p] || p || 'untrusted';
+}
+
 /**
  * @param {string} toolName
  * @param {{
@@ -12,7 +22,8 @@
  *   autoApproveTools?: string[],
  *   autoApproveCommands?: string[],
  *   commandArg?: string,
- *   approvalPolicy?: 'suggest'|'auto-edit'|'full-auto',
+ *   approvalPolicy?: 'untrusted'|'on-request'|'never'|'suggest'|'auto-edit'|'full-auto',
+ *   sandboxMode?: 'read-only'|'workspace-write'|'danger-full-access',
  *   toolKind?: 'edit'|'command'|'other',
  * }} policy
  * @returns {boolean} true if the tool may run without asking the user
@@ -21,12 +32,23 @@ function shouldAutoApprove(toolName, policy) {
   if (!policy) return false;
   if (policy.autoApprove) return true;
 
-  // Three-tier policy mirroring Codex CLI's suggest/auto-edit/full-auto:
-  //   suggest    — confirm every mutating tool (the default / safest)
-  //   auto-edit  — file edits run without confirmation, shell commands still ask
-  //   full-auto  — nothing asks (equivalent to autoApprove: true)
-  if (policy.approvalPolicy === 'full-auto') return true;
-  if (policy.approvalPolicy === 'auto-edit' && policy.toolKind === 'edit') return true;
+  // Two independent axes, matching current Codex CLI:
+  //   approvalPolicy — when does a human get asked at all
+  //     untrusted  — always ask before a mutating tool (safest, the default)
+  //     on-request — auto-approve mutations that are contained by the active
+  //                  sandbox (workspace-write file edits, sandboxed commands);
+  //                  still ask for anything the sandbox can't constrain
+  //     never      — never ask (equivalent to autoApprove: true)
+  //   sandboxMode — how much containment a mutating tool actually runs under
+  //     read-only          — no mutations allowed at all, regardless of approval
+  //     workspace-write     — file edits + sandboxed shell commands, contained to the workspace
+  //     danger-full-access  — no containment; "on-request" can't treat this as safe
+  const approvalPolicy = normalizeApprovalPolicy(policy.approvalPolicy);
+  if (approvalPolicy === 'never') return true;
+  if (approvalPolicy === 'on-request') {
+    const sandboxMode = policy.sandboxMode || 'danger-full-access';
+    if (sandboxMode === 'workspace-write' && (policy.toolKind === 'edit' || policy.toolKind === 'command')) return true;
+  }
 
   if (Array.isArray(policy.autoApproveTools) && policy.autoApproveTools.includes(toolName)) return true;
   // Finer-grained than whole-tool auto-approve: for run_command specifically,
@@ -39,4 +61,4 @@ function shouldAutoApprove(toolName, policy) {
   return false;
 }
 
-module.exports = { shouldAutoApprove };
+module.exports = { shouldAutoApprove, normalizeApprovalPolicy };

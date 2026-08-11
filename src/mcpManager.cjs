@@ -5,13 +5,14 @@
 
 'use strict';
 
-const { connectMcpServer } = require('./mcpClient.cjs');
+const { connectMcpServer, connectMcpHttpServer } = require('./mcpClient.cjs');
 const { registerExternalTool, unregisterExternalTool } = require('./tools.cjs');
 
 let activeServers = []; // [{name, close, toolNames: string[]}]
 
 /**
- * @param {Array<{name: string, command: string, args?: string[], env?: object}>} serverConfigs
+ * @param {Array<{name: string, command?: string, args?: string[], env?: object, url?: string, headers?: object}>} serverConfigs
+ *   Each entry is either a stdio server (command [+ args/env]) or an HTTP server (url [+ headers]).
  * @param {(message: string) => void} [logFn]
  */
 async function startMcpServers(serverConfigs, logFn) {
@@ -19,9 +20,9 @@ async function startMcpServers(serverConfigs, logFn) {
   if (!Array.isArray(serverConfigs) || serverConfigs.length === 0) return;
 
   for (const cfg of serverConfigs) {
-    if (!cfg.name || !cfg.command) continue;
+    if (!cfg.name || (!cfg.command && !cfg.url)) continue;
     try {
-      const { tools: mcpTools, callTool, close } = await connectMcpServer(cfg);
+      const { tools: mcpTools, callTool, close } = await (cfg.url ? connectMcpHttpServer(cfg) : connectMcpServer(cfg));
       const toolNames = [];
       for (const t of mcpTools) {
         const localName = `mcp_${cfg.name}_${t.name}`.replace(/[^a-zA-Z0-9_]/g, '_');

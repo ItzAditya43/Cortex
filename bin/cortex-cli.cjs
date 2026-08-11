@@ -12,6 +12,7 @@ const path = require('path');
 const readline = require('readline');
 const { runTurn } = require('../src/agentLoop.cjs');
 const { loadMemoryNotes } = require('../src/memory.cjs');
+const { reviewAction } = require('../src/approveForMe.cjs');
 
 function parseArgs(argv) {
   const opts = {
@@ -25,8 +26,9 @@ function parseArgs(argv) {
     maxSteps: 25,
     contextBudgetTokens: 6000,
     autoApprove: false,
-    sandboxCommands: false,
+    sandboxMode: 'danger-full-access',
     sandboxAllowNetwork: false,
+    approveForMe: false,
     json: false,
     prompt: null,
   };
@@ -39,8 +41,9 @@ function parseArgs(argv) {
     else if (a === '--provider') opts.provider = argv[++i];
     else if (a === '--api-key') opts.apiKey = argv[++i];
     else if (a === '--auto-approve') opts.autoApprove = true;
-    else if (a === '--sandbox') opts.sandboxCommands = true;
+    else if (a === '--sandbox') opts.sandboxMode = argv[++i]; // read-only | workspace-write | danger-full-access
     else if (a === '--sandbox-allow-network') opts.sandboxAllowNetwork = true;
+    else if (a === '--approve-for-me') opts.approveForMe = true;
     else if (a === '--json') opts.json = true;
     else if (a === '--max-steps') opts.maxSteps = parseInt(argv[++i], 10);
     else if (a === '--help' || a === '-h') {
@@ -65,8 +68,9 @@ Flags:
   --provider <name>         "ollama" or "openai-compatible" (default: ollama, or $CORTEX_PROVIDER)
   --api-key <key>           API key for openai-compatible providers (or $CORTEX_API_KEY)
   --auto-approve            run mutating tools without confirmation (needed for CI/unattended use)
-  --sandbox                 run shell commands inside a bubblewrap sandbox (Linux, requires bwrap)
-  --sandbox-allow-network   allow network access inside the sandbox (only with --sandbox)
+  --sandbox <mode>          read-only | workspace-write | danger-full-access (default: danger-full-access)
+  --sandbox-allow-network   allow network access inside the sandbox (only with --sandbox workspace-write)
+  --approve-for-me          auto-review pending approvals with a model call instead of asking interactively
   --max-steps <n>           max tool-call steps per turn (default: 25)
   --json                    emit one JSON object per line instead of human-readable output
 `);
@@ -92,11 +96,21 @@ async function runOnce(opts, text, history) {
       contextBudgetTokens: opts.contextBudgetTokens,
       memoryNotes: loadMemoryNotes(opts.root),
       planMode: false,
-      ctx: { host: opts.host, sandboxCommands: opts.sandboxCommands, sandboxAllowNetwork: opts.sandboxAllowNetwork },
+      ctx: { host: opts.host, sandboxMode: opts.sandboxMode, sandboxAllowNetwork: opts.sandboxAllowNetwork },
       onToken: () => {},
       onToolCall: (name, args) => emit(opts, { type: 'toolCall', name, args }, `> ${name}(${JSON.stringify(args)})`),
       requestApproval: async (name, args) => {
         if (opts.autoApprove) return true;
+        if (opts.approveForMe) {
+          const review = await reviewAction(
+            { host: opts.host, provider: opts.provider, apiKey: opts.apiKey, model: opts.fastModel || opts.model },
+            name,
+            args,
+            text
+          );
+          emit(opts, { type: 'autoReview', name, safe: review.safe, reason: review.reason }, `  ~ auto-review: ${review.safe ? 'SAFE' : 'needs human'} — ${review.reason}`);
+          if (review.safe) return true;
+        }
         if (!opts.json) {
           const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
           const answer = await new Promise((res) => rl.question(`Approve ${name}(${JSON.stringify(args)})? [y/N] `, res));

@@ -121,24 +121,35 @@
         },
         "cortex.approvalPolicy": {
           "type": "string",
-          "enum": ["suggest", "auto-edit", "full-auto"],
-          "default": "suggest",
-          "description": "Codex-CLI-style approval tiers. \"suggest\": confirm every mutating tool (safest). \"auto-edit\": file writes/edits/deletes run without confirmation, shell commands still ask. \"full-auto\": nothing asks for confirmation."
+          "enum": ["untrusted", "on-request", "never"],
+          "default": "untrusted",
+          "description": "Matches current Codex CLI. \"untrusted\": confirm every mutating tool (safest). \"on-request\": auto-approve mutations that are contained by the active sandbox (see cortex.sandboxMode) — anything the sandbox can't constrain still asks. \"never\": nothing asks for confirmation. Legacy values \"suggest\"/\"auto-edit\"/\"full-auto\" (this project's original naming) are still accepted."
+        },
+        "cortex.sandboxMode": {
+          "type": "string",
+          "enum": ["read-only", "workspace-write", "danger-full-access"],
+          "default": "danger-full-access",
+          "description": "Matches current Codex CLI. \"read-only\": no file edits or shell commands allowed at all, regardless of approval. \"workspace-write\": file edits stay in the workspace and shell commands run inside a bubblewrap sandbox (Linux, requires bwrap) with network off by default. \"danger-full-access\": no containment — falls back to unsandboxed execution."
         },
         "cortex.fastModel": {
           "type": "string",
           "default": "",
           "description": "Optional smaller/faster model used for read-only investigation steps (read_file, list_dir, search_code) — the main model is used once the agent needs to write code or run commands. Leave empty to always use the main model."
         },
-        "cortex.sandboxCommands": {
+        "cortex.approveForMe": {
           "type": "boolean",
           "default": false,
-          "description": "Run run_command/run_background inside a bubblewrap sandbox (Linux only, requires bwrap installed) — the rest of the filesystem is mounted read-only and network is disabled by default. Falls back to unsandboxed execution with a log note if bwrap isn't available."
+          "description": "Codex-CLI-style auto-review: before falling back to asking you, a model call (cortex.fastModel if set, else cortex.model) classifies whether a pending action looks safe and auto-approves it if so. Anything it can't confidently call safe still asks you."
         },
         "cortex.sandboxAllowNetwork": {
           "type": "boolean",
           "default": false,
-          "description": "Allow network access from inside the command sandbox (only relevant when cortex.sandboxCommands is on)."
+          "description": "Allow network access from inside the command sandbox (only relevant when cortex.sandboxMode is \"workspace-write\")."
+        },
+        "cortex.sandboxCommands": {
+          "type": "boolean",
+          "default": false,
+          "description": "Deprecated — use cortex.sandboxMode: \"workspace-write\" instead. Kept only so existing settings.json files with this key keep working."
         },
         "cortex.autoApproveCommands": {
           "type": "array",
@@ -165,16 +176,18 @@
         "cortex.mcpServers": {
           "type": "array",
           "default": [],
-          "description": "MCP (Model Context Protocol) servers to connect to at startup. Each server's tools are added to the agent's toolset, prefixed \"mcp_<name>_\".",
+          "description": "MCP (Model Context Protocol) servers to connect to at startup. Each server's tools are added to the agent's toolset, prefixed \"mcp_<name>_\". Give either \"command\" (local, stdio) or \"url\" (remote, streamable HTTP) per entry.",
           "items": {
             "type": "object",
             "properties": {
               "name": { "type": "string" },
-              "command": { "type": "string" },
+              "command": { "type": "string", "description": "Local server: executable to spawn." },
               "args": { "type": "array", "items": { "type": "string" } },
-              "env": { "type": "object" }
+              "env": { "type": "object" },
+              "url": { "type": "string", "description": "Remote server: streamable-HTTP MCP endpoint." },
+              "headers": { "type": "object", "description": "Extra headers (e.g. Authorization) sent with each request to a url server." }
             },
-            "required": ["name", "command"]
+            "required": ["name"]
           }
         },
         "cortex.schedules": {

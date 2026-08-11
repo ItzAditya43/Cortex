@@ -17,6 +17,7 @@ const {
 const { listModels } = require('./provider.cjs');
 const { shouldAutoApprove } = require('./permissions.cjs');
 const { retrieveRelevantNotes } = require('./semanticMemory.cjs');
+const { reviewAction } = require('./approveForMe.cjs');
 const logger = require('./logger.cjs');
 
 const MUTATING_TOOLS = Object.entries(tools)
@@ -107,8 +108,9 @@ class ChatViewProvider {
       maxSteps: c.get('maxSteps'),
       contextBudgetTokens: c.get('contextBudgetTokens'),
       webhookUrl: c.get('webhookUrl') || '',
-      sandboxCommands: !!c.get('sandboxCommands'),
+      sandboxMode: c.get('sandboxMode') || (c.get('sandboxCommands') ? 'workspace-write' : 'danger-full-access'),
       sandboxAllowNetwork: !!c.get('sandboxAllowNetwork'),
+      approveForMe: !!c.get('approveForMe'),
     };
   }
 
@@ -263,6 +265,9 @@ class ChatViewProvider {
         this.sendSessions();
         break;
       }
+      case 'forkSession':
+        this.forkSession();
+        break;
       case 'revert':
         await this.revertChange(msg.id);
         break;
@@ -281,6 +286,26 @@ class ChatViewProvider {
     const root = this.root;
     const sessions = root ? listSessions(root) : [];
     this.post({ type: 'sessions', items: sessions, currentId: this.sessionId });
+  }
+
+  // Branches the current conversation into a brand-new session that starts
+  // with an exact copy of the history so far — lets the user try a different
+  // approach from this point without losing (or overwriting) the original
+  // thread, mirroring Codex CLI's session fork.
+  forkSession() {
+    const root = this.root;
+    if (!root) return;
+    const forkedId = nonce().slice(0, 8);
+    const historyCopy = JSON.parse(JSON.stringify(this.history));
+    saveHistory(root, forkedId, historyCopy);
+    touchSession(root, forkedId, historyCopy);
+    this.sessionId = forkedId;
+    this.history = historyCopy;
+    this.revertable.clear();
+    this.diffShownFor.clear();
+    this.checkpoints = [];
+    this.post({ type: 'restoreSession', id: forkedId, messages: simplifyHistoryForDisplay(this.history) });
+    this.sendSessions();
   }
 
   loadSession(id) {
@@ -409,7 +434,7 @@ class ChatViewProvider {
         ctx: {
           host: cfg.host,
           webhookUrl: cfg.webhookUrl,
-          sandboxCommands: cfg.sandboxCommands,
+          sandboxMode: cfg.sandboxMode,
           sandboxAllowNetwork: cfg.sandboxAllowNetwork,
           delegateConfig: {
             host: cfg.host,
@@ -438,10 +463,21 @@ class ChatViewProvider {
               autoApproveCommands: cfg.autoApproveCommands,
               commandArg: name === 'run_command' ? args.command : undefined,
               approvalPolicy: cfg.approvalPolicy,
+              sandboxMode: cfg.sandboxMode,
               toolKind: tools[name]?.kind,
             })
           )
             return true;
+          if (cfg.approveForMe) {
+            const review = await reviewAction(
+              { host: cfg.host, provider: cfg.provider, apiKey: cfg.apiKey, model: cfg.fastModel || cfg.model },
+              name,
+              args,
+              text
+            );
+            this.post({ type: 'autoReview', id: callId, safe: review.safe, reason: review.reason });
+            if (review.safe) return true;
+          }
           return this.requestApproval(name, args, callId);
         },
         onToolResult: (result, isError, callId, snapshot) => {

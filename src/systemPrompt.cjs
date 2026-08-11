@@ -6,20 +6,40 @@ const { toolListForPrompt } = require('./tools.cjs');
 
 // Project-local conventions files: .cortexrules (Cline's .clinerules
 // convention) and AGENTS.md (the Codex CLI / cross-tool convention —
-// https://agents.md). Both are supported so a repo only needs one file to
-// drive Cortex, Cline, and Codex consistently; if both exist, both are
-// included since they may cover different things.
-function loadProjectRules(cwd) {
+// https://agents.md, also used by Cursor/Copilot/Cline). Both are checked at
+// every directory level from the currently open file up to the workspace
+// root, matching Codex's discovery: nearer files are more specific, so they
+// are listed *last* and the prompt tells the model closer-wins on conflict.
+function loadProjectRules(cwd, openFile) {
   if (!cwd) return '';
+  // Walk leaf -> root first (dirs ends up [nearest, ..., root]), then
+  // reverse once so the final order is root -> nearest — i.e. root-first,
+  // nearest-to-the-open-file last, so "closer wins" reads naturally as "the
+  // later section wins" for the model.
+  const dirs = [];
+  if (openFile) {
+    let dir = path.dirname(path.join(cwd, openFile));
+    const seen = new Set();
+    while (dir.startsWith(cwd) && dir !== cwd && !seen.has(dir)) {
+      dirs.push(dir);
+      seen.add(dir);
+      dir = path.dirname(dir);
+    }
+  }
+  dirs.push(cwd);
+  dirs.reverse();
+
   const parts = [];
-  for (const name of ['.cortexrules', 'AGENTS.md']) {
-    const f = path.join(cwd, name);
-    if (!fs.existsSync(f)) continue;
-    try {
-      const content = fs.readFileSync(f, 'utf8').trim();
-      if (content) parts.push(`--- ${name} ---\n${content}`);
-    } catch {
-      // unreadable file — skip rather than fail the whole prompt build
+  for (const dir of dirs) {
+    for (const name of ['.cortexrules', 'AGENTS.md']) {
+      const f = path.join(dir, name);
+      if (!fs.existsSync(f)) continue;
+      try {
+        const content = fs.readFileSync(f, 'utf8').trim();
+        if (content) parts.push(`--- ${path.relative(cwd, f) || name} ---\n${content}`);
+      } catch {
+        // unreadable file — skip rather than fail the whole prompt build
+      }
     }
   }
   return parts.join('\n\n');
@@ -31,7 +51,7 @@ function loadProjectRules(cwd) {
 // model — quality of tool use scales with model strength, but the mechanism
 // itself is universal.
 function buildSystemPrompt({ memoryNotes, cwd, openFile, planMode }) {
-  const projectRules = loadProjectRules(cwd);
+  const projectRules = loadProjectRules(cwd, openFile);
   return `You are Cortex, an autonomous coding assistant embedded in VS Code, similar in spirit to Cline/Claude Code, but running entirely on local models via Ollama. You read, write, edit, and run code directly inside the user's open workspace at:
 ${cwd}
 ${openFile ? `\nThe user currently has this file open in the editor: ${openFile}\n` : ''}
@@ -59,7 +79,7 @@ Guidelines:
 - If a request is ambiguous, make the most reasonable assumption and proceed rather than stalling — only ask the user a question (as a final plain-text answer, no tool call) if you genuinely cannot proceed without more information.
 - Be thorough while working, but concise in your final summary to the user.
 ${memoryNotes ? `\nLong-term memory notes from previous sessions in this workspace:\n${memoryNotes}` : ''}
-${projectRules ? `\nProject rules (follow these strictly):\n${projectRules}` : ''}`;
+${projectRules ? `\nProject rules (follow these strictly; if multiple sections conflict, the later/more specific one wins):\n${projectRules}` : ''}`;
 }
 
 module.exports = { buildSystemPrompt, loadProjectRules };

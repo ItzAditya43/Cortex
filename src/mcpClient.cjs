@@ -107,4 +107,51 @@ function connectMcpServer(config) {
   });
 }
 
-module.exports = { connectMcpServer };
+// Streamable-HTTP MCP transport (for remote servers, vs. the stdio transport
+// above for local ones). Each JSON-RPC call is a single POST; the MCP
+// session id header, if the server returns one, is echoed back on
+// subsequent requests. SSE-streamed responses aren't consumed here (only the
+// non-streaming JSON reply) — enough for straightforward tool servers, not
+// a full implementation of the spec's server-push features.
+function connectMcpHttpServer(config) {
+  let sessionId = null;
+  let nextId = 1;
+
+  async function send(method, params) {
+    const headers = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' };
+    if (sessionId) headers['Mcp-Session-Id'] = sessionId;
+    if (config.headers) Object.assign(headers, config.headers);
+    const res = await fetch(config.url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ jsonrpc: '2.0', id: nextId++, method, params: params || {} }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    const returnedSession = res.headers.get('mcp-session-id');
+    if (returnedSession) sessionId = returnedSession;
+    if (!res.ok) throw new Error(`MCP HTTP server returned ${res.status}`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error.message || 'MCP error');
+    return data.result;
+  }
+
+  return (async () => {
+    await send('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'cortex', version: '0.1.0' },
+    });
+    const result = await send('tools/list');
+    return {
+      tools: result?.tools || [],
+      callTool: async (name, args) => {
+        const r = await send('tools/call', { name, arguments: args || {} });
+        const parts = r?.content || [];
+        return parts.map((p) => (p.type === 'text' ? p.text : JSON.stringify(p))).join('\n') || '(no output)';
+      },
+      close: () => {}, // stateless over HTTP — nothing to tear down
+    };
+  })();
+}
+
+module.exports = { connectMcpServer, connectMcpHttpServer };
