@@ -7,12 +7,27 @@
 
 /**
  * @param {string} toolName
- * @param {{autoApprove?: boolean, autoApproveTools?: string[], autoApproveCommands?: string[], commandArg?: string}} policy
+ * @param {{
+ *   autoApprove?: boolean,
+ *   autoApproveTools?: string[],
+ *   autoApproveCommands?: string[],
+ *   commandArg?: string,
+ *   approvalPolicy?: 'suggest'|'auto-edit'|'full-auto',
+ *   toolKind?: 'edit'|'command'|'other',
+ * }} policy
  * @returns {boolean} true if the tool may run without asking the user
  */
 function shouldAutoApprove(toolName, policy) {
   if (!policy) return false;
   if (policy.autoApprove) return true;
+
+  // Three-tier policy mirroring Codex CLI's suggest/auto-edit/full-auto:
+  //   suggest    — confirm every mutating tool (the default / safest)
+  //   auto-edit  — file edits run without confirmation, shell commands still ask
+  //   full-auto  — nothing asks (equivalent to autoApprove: true)
+  if (policy.approvalPolicy === 'full-auto') return true;
+  if (policy.approvalPolicy === 'auto-edit' && policy.toolKind === 'edit') return true;
+
   if (Array.isArray(policy.autoApproveTools) && policy.autoApproveTools.includes(toolName)) return true;
   // Finer-grained than whole-tool auto-approve: for run_command specifically,
   // let the user allowlist safe command prefixes (e.g. "npm test", "git status")

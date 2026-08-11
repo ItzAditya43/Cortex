@@ -29,6 +29,7 @@ function activate(context) {
         provider: c.get('provider') || 'ollama',
         apiKey: c.get('apiKey') || '',
         model: c.get('model'),
+        fastModel: c.get('fastModel') || '',
         temperature: c.get('temperature'),
         maxSteps: c.get('maxSteps'),
         contextBudgetTokens: c.get('contextBudgetTokens'),

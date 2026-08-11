@@ -67,6 +67,7 @@ async function runSchedule(schedule, { root, runConfig, onResult, onError, logFn
       provider: runConfig.provider,
       apiKey: runConfig.apiKey,
       model: runConfig.model,
+      fastModel: runConfig.fastModel,
       temperature: runConfig.temperature,
       maxSteps: runConfig.maxSteps,
       contextBudgetTokens: runConfig.contextBudgetTokens,

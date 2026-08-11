@@ -4,18 +4,25 @@ const fs = require('fs');
 const path = require('path');
 const { toolListForPrompt } = require('./tools.cjs');
 
-// Project-local conventions file, analogous to Cline's .clinerules — lets a
-// repo pin coding standards/architecture notes that apply regardless of
-// which session or model is driving the agent.
+// Project-local conventions files: .cortexrules (Cline's .clinerules
+// convention) and AGENTS.md (the Codex CLI / cross-tool convention —
+// https://agents.md). Both are supported so a repo only needs one file to
+// drive Cortex, Cline, and Codex consistently; if both exist, both are
+// included since they may cover different things.
 function loadProjectRules(cwd) {
   if (!cwd) return '';
-  const f = path.join(cwd, '.cortexrules');
-  if (!fs.existsSync(f)) return '';
-  try {
-    return fs.readFileSync(f, 'utf8').trim();
-  } catch {
-    return '';
+  const parts = [];
+  for (const name of ['.cortexrules', 'AGENTS.md']) {
+    const f = path.join(cwd, name);
+    if (!fs.existsSync(f)) continue;
+    try {
+      const content = fs.readFileSync(f, 'utf8').trim();
+      if (content) parts.push(`--- ${name} ---\n${content}`);
+    } catch {
+      // unreadable file — skip rather than fail the whole prompt build
+    }
   }
+  return parts.join('\n\n');
 }
 
 // Tool-calling is implemented via a strict text protocol instead of Ollama's
@@ -24,6 +31,7 @@ function loadProjectRules(cwd) {
 // model — quality of tool use scales with model strength, but the mechanism
 // itself is universal.
 function buildSystemPrompt({ memoryNotes, cwd, openFile, planMode }) {
+  const projectRules = loadProjectRules(cwd);
   return `You are Cortex, an autonomous coding assistant embedded in VS Code, similar in spirit to Cline/Claude Code, but running entirely on local models via Ollama. You read, write, edit, and run code directly inside the user's open workspace at:
 ${cwd}
 ${openFile ? `\nThe user currently has this file open in the editor: ${openFile}\n` : ''}
@@ -51,7 +59,7 @@ Guidelines:
 - If a request is ambiguous, make the most reasonable assumption and proceed rather than stalling — only ask the user a question (as a final plain-text answer, no tool call) if you genuinely cannot proceed without more information.
 - Be thorough while working, but concise in your final summary to the user.
 ${memoryNotes ? `\nLong-term memory notes from previous sessions in this workspace:\n${memoryNotes}` : ''}
-${loadProjectRules(cwd) ? `\nProject rules (from .cortexrules — follow these strictly):\n${loadProjectRules(cwd)}` : ''}`;
+${projectRules ? `\nProject rules (follow these strictly):\n${projectRules}` : ''}`;
 }
 
 module.exports = { buildSystemPrompt, loadProjectRules };

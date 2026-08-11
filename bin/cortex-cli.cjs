@@ -20,10 +20,13 @@ function parseArgs(argv) {
     provider: process.env.CORTEX_PROVIDER || 'ollama',
     apiKey: process.env.CORTEX_API_KEY || '',
     model: process.env.CORTEX_MODEL || 'qwen2.5-coder:3b',
+    fastModel: process.env.CORTEX_FAST_MODEL || '',
     temperature: 0.2,
     maxSteps: 25,
     contextBudgetTokens: 6000,
     autoApprove: false,
+    sandboxCommands: false,
+    sandboxAllowNetwork: false,
     json: false,
     prompt: null,
   };
@@ -31,10 +34,13 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === '-p' || a === '--prompt') opts.prompt = argv[++i];
     else if (a === '--model') opts.model = argv[++i];
+    else if (a === '--fast-model') opts.fastModel = argv[++i];
     else if (a === '--host') opts.host = argv[++i];
     else if (a === '--provider') opts.provider = argv[++i];
     else if (a === '--api-key') opts.apiKey = argv[++i];
     else if (a === '--auto-approve') opts.autoApprove = true;
+    else if (a === '--sandbox') opts.sandboxCommands = true;
+    else if (a === '--sandbox-allow-network') opts.sandboxAllowNetwork = true;
     else if (a === '--json') opts.json = true;
     else if (a === '--max-steps') opts.maxSteps = parseInt(argv[++i], 10);
     else if (a === '--help' || a === '-h') {
@@ -53,13 +59,16 @@ Usage:
   cortex-cli -p "<prompt>" [flags]       one-shot run, exits when done
 
 Flags:
-  --model <name>        model to use (default: qwen2.5-coder:3b, or $CORTEX_MODEL)
-  --host <url>          provider host (default: http://localhost:11434, or $CORTEX_HOST)
-  --provider <name>     "ollama" or "openai-compatible" (default: ollama, or $CORTEX_PROVIDER)
-  --api-key <key>       API key for openai-compatible providers (or $CORTEX_API_KEY)
-  --auto-approve        run mutating tools without confirmation (needed for CI/unattended use)
-  --max-steps <n>       max tool-call steps per turn (default: 25)
-  --json                emit one JSON object per line instead of human-readable output
+  --model <name>            model to use (default: qwen2.5-coder:3b, or $CORTEX_MODEL)
+  --fast-model <name>       optional smaller model for read-only investigation steps (or $CORTEX_FAST_MODEL)
+  --host <url>              provider host (default: http://localhost:11434, or $CORTEX_HOST)
+  --provider <name>         "ollama" or "openai-compatible" (default: ollama, or $CORTEX_PROVIDER)
+  --api-key <key>           API key for openai-compatible providers (or $CORTEX_API_KEY)
+  --auto-approve            run mutating tools without confirmation (needed for CI/unattended use)
+  --sandbox                 run shell commands inside a bubblewrap sandbox (Linux, requires bwrap)
+  --sandbox-allow-network   allow network access inside the sandbox (only with --sandbox)
+  --max-steps <n>           max tool-call steps per turn (default: 25)
+  --json                    emit one JSON object per line instead of human-readable output
 `);
 }
 
@@ -77,11 +86,13 @@ async function runOnce(opts, text, history) {
       provider: opts.provider,
       apiKey: opts.apiKey,
       model: opts.model,
+      fastModel: opts.fastModel,
       temperature: opts.temperature,
       maxSteps: opts.maxSteps,
       contextBudgetTokens: opts.contextBudgetTokens,
       memoryNotes: loadMemoryNotes(opts.root),
       planMode: false,
+      ctx: { host: opts.host, sandboxCommands: opts.sandboxCommands, sandboxAllowNetwork: opts.sandboxAllowNetwork },
       onToken: () => {},
       onToolCall: (name, args) => emit(opts, { type: 'toolCall', name, args }, `> ${name}(${JSON.stringify(args)})`),
       requestApproval: async (name, args) => {

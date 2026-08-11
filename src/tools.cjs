@@ -13,6 +13,7 @@ const path = require('path');
 const { execSync, spawn } = require('child_process');
 const { appendMemoryNote } = require('./memory.cjs');
 const { indexNote } = require('./semanticMemory.cjs');
+const { wrapCommand } = require('./sandbox.cjs');
 
 const MAX_RESULT_CHARS = 8000;
 
@@ -44,6 +45,7 @@ const tools = {
   read_file: {
     description: 'Read a file\'s contents (with line numbers). Arguments: {"path": string}',
     confirm: false,
+    readOnly: true,
     run: ({ path: p }, root) => {
       const full = safePath(root, p);
       if (!fs.existsSync(full)) return `ERROR: file not found: ${p}`;
@@ -57,6 +59,7 @@ const tools = {
   write_file: {
     description: 'Create a new file or fully overwrite an existing file. Arguments: {"path": string, "content": string}',
     confirm: true,
+    kind: 'edit',
     preview: ({ path: p, content }, root) => {
       const full = safePath(root, p);
       const before = fs.existsSync(full) && !fs.statSync(full).isDirectory() ? fs.readFileSync(full, 'utf8') : '';
@@ -74,6 +77,7 @@ const tools = {
     description:
       'Replace one exact, unique snippet of text in a file with new text. Use this for small/targeted changes. Arguments: {"path": string, "old_str": string, "new_str": string}',
     confirm: true,
+    kind: 'edit',
     preview: ({ path: p, old_str, new_str }, root) => {
       const full = safePath(root, p);
       if (!fs.existsSync(full)) return { path: p, error: `file not found: ${p}` };
@@ -101,6 +105,7 @@ const tools = {
   list_dir: {
     description: 'List files and folders at a path, non-recursive. Arguments: {"path": string}',
     confirm: false,
+    readOnly: true,
     run: ({ path: p }, root) => {
       const full = safePath(root, p || '.');
       if (!fs.existsSync(full)) return `ERROR: path not found: ${p}`;
@@ -116,6 +121,7 @@ const tools = {
   search_code: {
     description: 'Search for a text pattern across files (like grep -rn). Arguments: {"pattern": string, "path": string (optional, default ".")}',
     confirm: false,
+    readOnly: true,
     run: ({ pattern, path: p }, root) => {
       if (!pattern) return 'ERROR: pattern is required';
       try {
@@ -135,13 +141,19 @@ const tools = {
   run_command: {
     description: 'Run a shell command in the workspace root (e.g. tests, linters, git, build steps) and return stdout/stderr. Arguments: {"command": string}',
     confirm: true,
-    run: ({ command }, root) => {
+    kind: 'command',
+    run: ({ command }, root, ctx) => {
       if (!command) return 'ERROR: command is required';
+      const { command: toRun, sandboxed } = ctx?.sandboxCommands
+        ? wrapCommand(command, root, { allowNetwork: !!ctx.sandboxAllowNetwork })
+        : { command, sandboxed: false };
       try {
-        const out = execSync(command, { encoding: 'utf8', cwd: root, maxBuffer: 1024 * 1024 * 10, timeout: 60_000 });
-        return truncate(out || '(command produced no output)');
+        const out = execSync(toRun, { encoding: 'utf8', cwd: root, maxBuffer: 1024 * 1024 * 10, timeout: 60_000 });
+        return truncate(`${sandboxed ? '[sandboxed]\n' : ''}${out || '(command produced no output)'}`);
       } catch (err) {
-        return truncate(`EXIT CODE: ${err.status}\nSTDOUT:\n${err.stdout || ''}\nSTDERR:\n${err.stderr || err.message}`);
+        return truncate(
+          `${sandboxed ? '[sandboxed]\n' : ''}EXIT CODE: ${err.status}\nSTDOUT:\n${err.stdout || ''}\nSTDERR:\n${err.stderr || err.message}`
+        );
       }
     },
   },
@@ -163,10 +175,14 @@ const tools = {
     description:
       'Start a long-running shell command (dev server, watcher, build --watch) in the background and return an id immediately instead of blocking. Use read_background_output to poll its output and stop_background_process to kill it. Arguments: {"command": string}',
     confirm: true,
-    run: ({ command }, root) => {
+    kind: 'command',
+    run: ({ command }, root, ctx) => {
       if (!command) return 'ERROR: command is required';
       const id = `bg${++backgroundIdCounter}`;
-      const proc = spawn(command, { cwd: root, shell: true });
+      const { command: toRun, sandboxed } = ctx?.sandboxCommands
+        ? wrapCommand(command, root, { allowNetwork: !!ctx.sandboxAllowNetwork })
+        : { command, sandboxed: false };
+      const proc = spawn(toRun, { cwd: root, shell: true });
       const entry = { proc, output: [], exitCode: null };
       backgroundProcs.set(id, entry);
       proc.stdout.on('data', (d) => entry.output.push(d.toString()));
@@ -174,13 +190,14 @@ const tools = {
       proc.on('exit', (code) => {
         entry.exitCode = code;
       });
-      return `OK: started background process ${id} (pid ${proc.pid}). Use read_background_output {"id":"${id}"} to check on it.`;
+      return `OK: started background process ${id} (pid ${proc.pid})${sandboxed ? ' [sandboxed]' : ''}. Use read_background_output {"id":"${id}"} to check on it.`;
     },
   },
 
   read_background_output: {
     description: 'Read accumulated stdout/stderr from a process started with run_background, and whether it has exited. Arguments: {"id": string}',
     confirm: false,
+    readOnly: true,
     run: ({ id }) => {
       const entry = backgroundProcs.get(id);
       if (!entry) return `ERROR: no background process with id ${id}`;
@@ -193,6 +210,7 @@ const tools = {
   stop_background_process: {
     description: 'Kill a background process started with run_background. Arguments: {"id": string}',
     confirm: true,
+    kind: 'command',
     run: ({ id }) => {
       const entry = backgroundProcs.get(id);
       if (!entry) return `ERROR: no background process with id ${id}`;
@@ -224,6 +242,7 @@ const tools = {
         provider: ctx.delegateConfig.provider,
         apiKey: ctx.delegateConfig.apiKey,
         model: ctx.delegateConfig.model,
+        fastModel: ctx.delegateConfig.fastModel,
         temperature: ctx.delegateConfig.temperature,
         maxSteps: Math.min(ctx.delegateConfig.maxSteps, 15),
         memoryNotes: '',
@@ -249,6 +268,7 @@ const tools = {
   delete_file: {
     description: 'Delete a file (not a directory). Arguments: {"path": string}',
     confirm: true,
+    kind: 'edit',
     preview: ({ path: p }, root) => {
       const full = safePath(root, p);
       const before = fs.existsSync(full) && !fs.statSync(full).isDirectory() ? fs.readFileSync(full, 'utf8') : '';
@@ -266,6 +286,7 @@ const tools = {
   rename_file: {
     description: 'Rename or move a file to a new path within the workspace. Arguments: {"from": string, "to": string}',
     confirm: true,
+    kind: 'edit',
     preview: ({ from, to }, root) => {
       const full = safePath(root, from);
       const before = fs.existsSync(full) ? fs.readFileSync(full, 'utf8') : '';
@@ -284,6 +305,7 @@ const tools = {
   read_url: {
     description: 'Fetch a URL over HTTP(S) and return its text content (HTML tags stripped for readability). Arguments: {"url": string}',
     confirm: false,
+    readOnly: true,
     run: async ({ url }) => {
       if (!url) return 'ERROR: url is required';
       let parsed;

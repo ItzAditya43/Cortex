@@ -10,6 +10,8 @@ const { chat } = require('./provider.cjs');
 const { tools } = require('./tools.cjs');
 const { buildSystemPrompt } = require('./systemPrompt.cjs');
 const { buildContextMessages, DEFAULT_BUDGET_TOKENS } = require('./contextManager.cjs');
+const { verifySyntax } = require('./verify.cjs');
+const { pickModel } = require('./router.cjs');
 
 // Pull a TOOL_CALL: {...} instruction out of a model response.
 //
@@ -99,6 +101,7 @@ function parseToolCall(text) {
  * @param {string} opts.root             workspace root directory
  * @param {string} opts.host             ollama host
  * @param {string} opts.model            ollama model name
+ * @param {string} [opts.fastModel]      optional smaller/faster model routed to for read-only investigation steps (see router.cjs)
  * @param {number} opts.temperature
  * @param {number} opts.maxSteps
  * @param {string} opts.memoryNotes
@@ -123,6 +126,7 @@ async function runTurn(opts) {
     provider,
     apiKey,
     model,
+    fastModel,
     temperature,
     maxSteps,
     memoryNotes,
@@ -141,18 +145,20 @@ async function runTurn(opts) {
   } = opts;
 
   let steps = 0;
+  let usedMutatingTool = false;
 
   while (steps < maxSteps) {
     if (signal?.aborted) return;
     steps++;
 
+    const activeModel = pickModel({ model, fastModel, usedMutatingTool, isFirstStep: steps === 1 });
     const system = buildSystemPrompt({ memoryNotes, cwd: root, openFile, planMode });
     const messages = buildContextMessages(system, history, contextBudgetTokens);
-    onLog?.(`step ${steps}: sending ${messages.length} message(s) to ${model} (budget ${contextBudgetTokens} tok)`);
+    onLog?.(`step ${steps}: sending ${messages.length} message(s) to ${activeModel}${activeModel !== model ? ' (routed: fast)' : ''} (budget ${contextBudgetTokens} tok)`);
 
     let reply;
     try {
-      reply = await chat({ host, provider, apiKey, model, messages, temperature, signal, onToken, logFn: onLog });
+      reply = await chat({ host, provider, apiKey, model: activeModel, messages, temperature, signal, onToken, logFn: onLog });
     } catch (err) {
       if (err.name === 'AbortError') return;
       onLog?.(`step ${steps}: error — ${err.message}`);
@@ -186,6 +192,8 @@ async function runTurn(opts) {
       onToolResult(msg, true, null);
       continue;
     }
+
+    if (tool.confirm) usedMutatingTool = true; // route to the main model from here on, even if this call gets declined
 
     const args = toolCall.arguments || {};
     const callId = crypto.randomUUID();
@@ -222,6 +230,16 @@ async function runTurn(opts) {
       }
     }
 
+    // Pre-diff self-verification: catch a syntax-broken edit before the user
+    // spends time reviewing the diff, and before it's silently accepted as a
+    // successful TOOL_RESULT — local models are more prone to this than
+    // Claude/GPT-class models, so this closes a real gap cheaply.
+    let verification = null;
+    if (snapshot && snapshot.after !== undefined) {
+      verification = verifySyntax(snapshot.path, snapshot.after);
+      if (verification) snapshot.verification = verification;
+    }
+
     let result;
     let isError = false;
     try {
@@ -230,6 +248,10 @@ async function runTurn(opts) {
     } catch (err) {
       result = `ERROR running tool: ${err.message}`;
       isError = true;
+    }
+
+    if (!isError && verification && verification.ok === false) {
+      result += `\n\nSYNTAX WARNING: the file you just wrote does not parse. Details: ${verification.message}\nFix this before moving on — either re-read the file and correct it, or explain the issue to the user.`;
     }
 
     history.push({ role: 'user', content: `TOOL_RESULT:\n${result}` });

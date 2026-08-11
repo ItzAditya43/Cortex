@@ -97,14 +97,18 @@ class ChatViewProvider {
     return {
       host: c.get('host'),
       model: c.get('model'),
+      fastModel: c.get('fastModel') || '',
       provider: c.get('provider') || 'ollama',
       apiKey: c.get('apiKey') || '',
       autoApprove: c.get('autoApprove'),
+      approvalPolicy: c.get('approvalPolicy') || 'suggest',
       autoApproveCommands: c.get('autoApproveCommands') || [],
       temperature: c.get('temperature'),
       maxSteps: c.get('maxSteps'),
       contextBudgetTokens: c.get('contextBudgetTokens'),
       webhookUrl: c.get('webhookUrl') || '',
+      sandboxCommands: !!c.get('sandboxCommands'),
+      sandboxAllowNetwork: !!c.get('sandboxAllowNetwork'),
     };
   }
 
@@ -394,6 +398,7 @@ class ChatViewProvider {
         provider: cfg.provider,
         apiKey: cfg.apiKey,
         model: cfg.model,
+        fastModel: cfg.fastModel,
         temperature: cfg.temperature,
         maxSteps: cfg.maxSteps,
         contextBudgetTokens: cfg.contextBudgetTokens,
@@ -404,11 +409,14 @@ class ChatViewProvider {
         ctx: {
           host: cfg.host,
           webhookUrl: cfg.webhookUrl,
+          sandboxCommands: cfg.sandboxCommands,
+          sandboxAllowNetwork: cfg.sandboxAllowNetwork,
           delegateConfig: {
             host: cfg.host,
             provider: cfg.provider,
             apiKey: cfg.apiKey,
             model: cfg.model,
+            fastModel: cfg.fastModel,
             temperature: cfg.temperature,
             maxSteps: cfg.maxSteps,
             contextBudgetTokens: cfg.contextBudgetTokens,
@@ -429,6 +437,8 @@ class ChatViewProvider {
               autoApproveTools: this.autoApproveTools,
               autoApproveCommands: cfg.autoApproveCommands,
               commandArg: name === 'run_command' ? args.command : undefined,
+              approvalPolicy: cfg.approvalPolicy,
+              toolKind: tools[name]?.kind,
             })
           )
             return true;
