@@ -18,6 +18,7 @@ const { listModels } = require('./provider.cjs');
 const { shouldAutoApprove } = require('./permissions.cjs');
 const { retrieveRelevantNotes } = require('./semanticMemory.cjs');
 const { reviewAction } = require('./approveForMe.cjs');
+const { applyProfile } = require('./profiles.cjs');
 const logger = require('./logger.cjs');
 
 const MUTATING_TOOLS = Object.entries(tools)
@@ -95,14 +96,14 @@ class ChatViewProvider {
 
   cfg() {
     const c = vscode.workspace.getConfiguration('cortex');
-    return {
+    const base = {
       host: c.get('host'),
       model: c.get('model'),
       fastModel: c.get('fastModel') || '',
       provider: c.get('provider') || 'ollama',
       apiKey: c.get('apiKey') || '',
       autoApprove: c.get('autoApprove'),
-      approvalPolicy: c.get('approvalPolicy') || 'suggest',
+      approvalPolicy: c.get('approvalPolicy') || 'untrusted',
       autoApproveCommands: c.get('autoApproveCommands') || [],
       temperature: c.get('temperature'),
       maxSteps: c.get('maxSteps'),
@@ -112,6 +113,15 @@ class ChatViewProvider {
       sandboxAllowNetwork: !!c.get('sandboxAllowNetwork'),
       approveForMe: !!c.get('approveForMe'),
     };
+    return applyProfile(base, c.get('profiles') || {}, this.activeProfile || c.get('activeProfile') || '');
+  }
+
+  get activeProfile() {
+    return this.context.workspaceState.get('cortex.activeProfile', '');
+  }
+
+  set activeProfile(name) {
+    this.context.workspaceState.update('cortex.activeProfile', name || '');
   }
 
   get autoApproveTools() {
@@ -200,6 +210,10 @@ class ChatViewProvider {
         this.post({ type: 'config', ...this.cfg() });
         this.post({ type: 'mode', mode: this.mode });
         this.post({ type: 'autoApproveTools', tools: MUTATING_TOOLS, enabled: this.autoApproveTools });
+        {
+          const profilesCfg = vscode.workspace.getConfiguration('cortex').get('profiles') || {};
+          this.post({ type: 'profiles', names: Object.keys(profilesCfg), active: this.activeProfile });
+        }
         if (!root) {
           this.post({ type: 'banner', text: 'Open a folder/workspace to start using Cortex.' });
         }
@@ -219,6 +233,13 @@ class ChatViewProvider {
         break;
       case 'selectModel':
         await vscode.commands.executeCommand('cortex.selectModel');
+        break;
+      case 'selectProfile':
+        await vscode.commands.executeCommand('cortex.selectProfile');
+        break;
+      case 'setProfile':
+        this.activeProfile = msg.name || '';
+        this.post({ type: 'config', ...this.cfg() });
         break;
       case 'openDiff':
         await this.openDiff(msg.diffId);

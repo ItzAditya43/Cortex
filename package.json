@@ -85,6 +85,12 @@
         "command": "cortex.revertLastTurn",
         "title": "Revert Last Turn (all files)",
         "category": "Cortex"
+      },
+      {
+        "command": "cortex.selectProfile",
+        "title": "Select Profile",
+        "category": "Cortex",
+        "icon": "$(gear)"
       }
     ],
     "menus": {
@@ -204,6 +210,16 @@
             },
             "required": ["cron", "prompt"]
           }
+        },
+        "cortex.profiles": {
+          "type": "object",
+          "default": {},
+          "description": "Named presets you can switch between with the \"Cortex: Select Profile\" command (Codex-CLI-style --profile). Each key is a profile name; its value is a partial override of host/provider/apiKey/model/fastModel/temperature/maxSteps/contextBudgetTokens/approvalPolicy/sandboxMode/sandboxAllowNetwork/approveForMe/autoApprove — anything you omit falls back to your base settings. Example: {\"fast\": {\"model\": \"llama3.2:1b\", \"approvalPolicy\": \"on-request\", \"sandboxMode\": \"workspace-write\"}, \"careful\": {\"approvalPolicy\": \"untrusted\", \"sandboxMode\": \"read-only\"}}."
+        },
+        "cortex.activeProfile": {
+          "type": "string",
+          "default": "",
+          "description": "Default profile (a key from cortex.profiles) applied on startup. The \"Cortex: Select Profile\" command overrides this per-session without changing this setting."
         },
         "cortex.temperature": {
           "type": "number",

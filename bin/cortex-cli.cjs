@@ -8,29 +8,55 @@
 
 'use strict';
 
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { runTurn } = require('../src/agentLoop.cjs');
 const { loadMemoryNotes } = require('../src/memory.cjs');
 const { reviewAction } = require('../src/approveForMe.cjs');
+const { applyProfile } = require('../src/profiles.cjs');
+
+// User-level (~/.cortex/config.json) then project-level (.cortex/config.json)
+// JSON config, mirroring the VS Code settings surface — project overrides
+// user. Shape: { host, model, fastModel, provider, apiKey, temperature,
+// maxSteps, contextBudgetTokens, sandboxMode, sandboxAllowNetwork,
+// approveForMe, autoApprove, profiles: {name: {...overrides}} }. Entirely
+// optional; the CLI works fine with just env vars/flags if no file exists.
+function loadConfigFile(root) {
+  const merged = {};
+  for (const f of [path.join(os.homedir(), '.cortex', 'config.json'), path.join(root, '.cortex', 'config.json')]) {
+    if (!fs.existsSync(f)) continue;
+    try {
+      Object.assign(merged, JSON.parse(fs.readFileSync(f, 'utf8')));
+    } catch (err) {
+      console.error(`warning: could not parse ${f}: ${err.message}`);
+    }
+  }
+  return merged;
+}
 
 function parseArgs(argv) {
+  const root = process.cwd();
+  const fileCfg = loadConfigFile(root);
+
   const opts = {
-    root: process.cwd(),
-    host: process.env.CORTEX_HOST || 'http://localhost:11434',
-    provider: process.env.CORTEX_PROVIDER || 'ollama',
-    apiKey: process.env.CORTEX_API_KEY || '',
-    model: process.env.CORTEX_MODEL || 'qwen2.5-coder:3b',
-    fastModel: process.env.CORTEX_FAST_MODEL || '',
-    temperature: 0.2,
-    maxSteps: 25,
-    contextBudgetTokens: 6000,
-    autoApprove: false,
-    sandboxMode: 'danger-full-access',
-    sandboxAllowNetwork: false,
-    approveForMe: false,
+    root,
+    host: process.env.CORTEX_HOST || fileCfg.host || 'http://localhost:11434',
+    provider: process.env.CORTEX_PROVIDER || fileCfg.provider || 'ollama',
+    apiKey: process.env.CORTEX_API_KEY || fileCfg.apiKey || '',
+    model: process.env.CORTEX_MODEL || fileCfg.model || 'qwen2.5-coder:3b',
+    fastModel: process.env.CORTEX_FAST_MODEL || fileCfg.fastModel || '',
+    temperature: fileCfg.temperature ?? 0.2,
+    maxSteps: fileCfg.maxSteps ?? 25,
+    contextBudgetTokens: fileCfg.contextBudgetTokens ?? 6000,
+    autoApprove: !!fileCfg.autoApprove,
+    sandboxMode: fileCfg.sandboxMode || 'danger-full-access',
+    sandboxAllowNetwork: !!fileCfg.sandboxAllowNetwork,
+    approveForMe: !!fileCfg.approveForMe,
     json: false,
     prompt: null,
+    profile: '',
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -44,6 +70,7 @@ function parseArgs(argv) {
     else if (a === '--sandbox') opts.sandboxMode = argv[++i]; // read-only | workspace-write | danger-full-access
     else if (a === '--sandbox-allow-network') opts.sandboxAllowNetwork = true;
     else if (a === '--approve-for-me') opts.approveForMe = true;
+    else if (a === '--profile') opts.profile = argv[++i];
     else if (a === '--json') opts.json = true;
     else if (a === '--max-steps') opts.maxSteps = parseInt(argv[++i], 10);
     else if (a === '--help' || a === '-h') {
@@ -51,7 +78,12 @@ function parseArgs(argv) {
       process.exit(0);
     }
   }
-  return opts;
+
+  const finalOpts = opts.profile ? applyProfile(opts, fileCfg.profiles || {}, opts.profile) : opts;
+  if (opts.profile && finalOpts === opts && !(fileCfg.profiles || {})[opts.profile]) {
+    console.error(`warning: profile "${opts.profile}" not found in config (checked ~/.cortex/config.json and ./.cortex/config.json)`);
+  }
+  return finalOpts;
 }
 
 function printHelp() {
@@ -71,8 +103,14 @@ Flags:
   --sandbox <mode>          read-only | workspace-write | danger-full-access (default: danger-full-access)
   --sandbox-allow-network   allow network access inside the sandbox (only with --sandbox workspace-write)
   --approve-for-me          auto-review pending approvals with a model call instead of asking interactively
+  --profile <name>          apply a named preset from the "profiles" key in .cortex/config.json (project) or ~/.cortex/config.json (user)
   --max-steps <n>           max tool-call steps per turn (default: 25)
   --json                    emit one JSON object per line instead of human-readable output
+
+Config file (optional, both fully optional): ~/.cortex/config.json then ./.cortex/config.json (project overrides user).
+Same keys as the flags above (host, model, fastModel, provider, apiKey, temperature, maxSteps,
+contextBudgetTokens, sandboxMode, sandboxAllowNetwork, approveForMe, autoApprove), plus "profiles":
+{ "fast": { "model": "llama3.2:1b", "sandboxMode": "workspace-write" } }
 `);
 }
 

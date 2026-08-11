@@ -146,6 +146,27 @@ function activate(context) {
       }
     })
   );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cortex.selectProfile', async () => {
+      const c = vscode.workspace.getConfiguration('cortex');
+      const profiles = c.get('profiles') || {};
+      const names = Object.keys(profiles);
+      if (names.length === 0) {
+        vscode.window.showInformationMessage(
+          'No profiles configured. Add entries under the "cortex.profiles" setting (e.g. {"fast": {"model": "...", "approvalPolicy": "on-request"}}).'
+        );
+        return;
+      }
+      const picked = await vscode.window.showQuickPick(['(none — use base settings)', ...names], {
+        placeHolder: 'Select a Cortex profile',
+      });
+      if (picked === undefined) return;
+      provider.activeProfile = picked.startsWith('(none') ? '' : picked;
+      provider.post({ type: 'config', ...provider.cfg() });
+      vscode.window.showInformationMessage(`Cortex profile: ${provider.activeProfile || '(none)'}`);
+    })
+  );
 }
 
 function formatSize(bytes) {
