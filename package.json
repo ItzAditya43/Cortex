@@ -91,6 +91,16 @@
         "title": "Select Profile",
         "category": "Cortex",
         "icon": "$(gear)"
+      },
+      {
+        "command": "cortex.addSelectionToChat",
+        "title": "Add Selection to Cortex",
+        "category": "Cortex"
+      },
+      {
+        "command": "cortex.explainSelection",
+        "title": "Explain Selection with Cortex",
+        "category": "Cortex"
       }
     ],
     "menus": {
@@ -105,8 +115,33 @@
           "when": "view == cortex.chatView",
           "group": "navigation@2"
         }
+      ],
+      "editor/context": [
+        {
+          "command": "cortex.addSelectionToChat",
+          "when": "editorHasSelection",
+          "group": "cortex@1"
+        },
+        {
+          "command": "cortex.explainSelection",
+          "when": "editorHasSelection",
+          "group": "cortex@2"
+        }
       ]
     },
+    "keybindings": [
+      {
+        "command": "cortex.openChat",
+        "key": "ctrl+shift+l",
+        "mac": "cmd+shift+l"
+      },
+      {
+        "command": "cortex.addSelectionToChat",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k",
+        "when": "editorHasSelection"
+      }
+    ],
     "configuration": {
       "title": "Cortex",
       "properties": {

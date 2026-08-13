@@ -14,11 +14,12 @@ const {
   listSessions,
   deleteSession,
 } = require('./memory.cjs');
-const { listModels } = require('./provider.cjs');
+const { listModels, chat } = require('./provider.cjs');
 const { shouldAutoApprove } = require('./permissions.cjs');
 const { retrieveRelevantNotes } = require('./semanticMemory.cjs');
 const { reviewAction } = require('./approveForMe.cjs');
 const { applyProfile } = require('./profiles.cjs');
+const { generateProjectRules } = require('./initRules.cjs');
 const logger = require('./logger.cjs');
 
 const MUTATING_TOOLS = Object.entries(tools)
@@ -400,6 +401,125 @@ class ChatViewProvider {
     }
   }
 
+  // Claude-Code-style slash commands, intercepted before anything reaches
+  // the model. Returns true if `text` was a recognized command (handled or
+  // rejected with a message) so onSend can stop instead of treating it as a
+  // normal chat message.
+  async handleSlashCommand(text) {
+    const trimmed = text.trim();
+    if (!trimmed.startsWith('/')) return false;
+    const [cmd] = trimmed.slice(1).split(/\s+/);
+    const root = this.root;
+
+    // Only intercept a known, fixed set of commands. A message that merely
+    // starts with "/" (a pasted file path, a shell command the user is
+    // quoting, etc.) isn't one of these and should just go to the model —
+    // erroring on it would be a surprising trap for ordinary chat text.
+    if (!['clear', 'compact', 'init', 'help'].includes(cmd)) return false;
+
+    switch (cmd) {
+      case 'clear':
+        this.newChat();
+        return true;
+
+      case 'compact':
+        if (!root) {
+          this.post({ type: 'banner', text: 'Open a folder/workspace first.' });
+          return true;
+        }
+        await this.compactHistory();
+        return true;
+
+      case 'init':
+        if (!root) {
+          this.post({ type: 'banner', text: 'Open a folder/workspace first.' });
+          return true;
+        }
+        await this.initProjectRules();
+        return true;
+
+      case 'help':
+        this.post({
+          type: 'final',
+          text:
+            '**Available commands:**\n\n' +
+            '- `/clear` — start a new chat, discarding this session\'s history\n' +
+            '- `/compact` — summarize the conversation so far to free up context, keeping the gist\n' +
+            '- `/init` — scan this project and (re)generate `.cortexrules` with conventions the agent should follow\n' +
+            '- `/help` — show this message',
+          steps: 0,
+          elapsedMs: 0,
+        });
+        return true;
+
+      default:
+        return false; // unreachable given the guard above, kept for exhaustiveness
+    }
+  }
+
+  // Summarizes the current session's history into a single note, replacing
+  // the raw transcript — same idea as Claude Code's /compact: keeps working
+  // in the same session without the context budget silently dropping older
+  // turns (contextManager.cjs would otherwise just truncate from the front).
+  async compactHistory() {
+    const root = this.root;
+    if (!root || this.history.length === 0) {
+      this.post({ type: 'banner', text: 'Nothing to compact yet.' });
+      return;
+    }
+    this.post({ type: 'busy', value: true });
+    const cfg = this.cfg();
+    const transcript = this.history.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n').slice(0, 20_000);
+    try {
+      const summary = await chat({
+        host: cfg.host,
+        provider: cfg.provider,
+        apiKey: cfg.apiKey,
+        model: cfg.model,
+        temperature: 0.1,
+        messages: [
+          {
+            role: 'system',
+            content:
+              'Summarize the following coding-agent conversation into a concise brief a fresh agent could resume from: what the user asked for, what was already done (files touched, decisions made), and what remains. Plain text, no preamble.',
+          },
+          { role: 'user', content: transcript },
+        ],
+      });
+      const before = this.history.length;
+      this.history = [{ role: 'user', content: `[Earlier conversation summary]\n${summary.trim()}` }];
+      saveHistory(root, this.sessionId, this.history);
+      this.post({
+        type: 'final',
+        text: `Compacted ${before} message(s) into a summary. Continuing from here.\n\n---\n${summary.trim()}`,
+        steps: 0,
+        elapsedMs: 0,
+      });
+    } catch (err) {
+      this.post({ type: 'error', text: `/compact failed: ${err.message}` });
+    } finally {
+      this.post({ type: 'busy', value: false });
+    }
+  }
+
+  // Deterministic (no model call) project scan that writes/refreshes
+  // .cortexrules — analogous to Claude Code's /init generating CLAUDE.md,
+  // but done directly from package.json/file layout rather than an agent
+  // turn, so it's instant and doesn't depend on model quality.
+  async initProjectRules() {
+    const root = this.root;
+    this.post({ type: 'busy', value: true });
+    try {
+      const rules = generateProjectRules(root);
+      tools.write_file.run({ path: '.cortexrules', content: rules }, root);
+      this.post({ type: 'final', text: `Wrote \`.cortexrules\`:\n\n\`\`\`markdown\n${rules}\n\`\`\``, steps: 0, elapsedMs: 0 });
+    } catch (err) {
+      this.post({ type: 'error', text: `/init failed: ${err.message}` });
+    } finally {
+      this.post({ type: 'busy', value: false });
+    }
+  }
+
   async onSend(text) {
     if (!text || !text.trim()) return;
     const root = this.root;
@@ -408,11 +528,12 @@ class ChatViewProvider {
       return;
     }
     if (this.busy) return;
+    this.post({ type: 'userMessage', text });
+    if (await this.handleSlashCommand(text)) return;
 
     this.busy = true;
     this.abortController = new AbortController();
     this.post({ type: 'busy', value: true });
-    this.post({ type: 'userMessage', text });
 
     this.history.push({ role: 'user', content: text });
 
@@ -429,9 +550,17 @@ class ChatViewProvider {
         // fall back to the full flat notes already loaded above
       }
     }
-    const openFile = vscode.window.activeTextEditor
-      ? vscode.workspace.asRelativePath(vscode.window.activeTextEditor.document.uri)
-      : undefined;
+    const editor = vscode.window.activeTextEditor;
+    const openFile = editor ? vscode.workspace.asRelativePath(editor.document.uri) : undefined;
+    const selection =
+      editor && !editor.selection.isEmpty
+        ? {
+            text: editor.document.getText(editor.selection),
+            file: openFile,
+            startLine: editor.selection.start.line + 1,
+            endLine: editor.selection.end.line + 1,
+          }
+        : undefined;
     const planMode = this.mode === 'plan';
     const startedAt = Date.now();
     const turnCallIds = [];
@@ -450,6 +579,7 @@ class ChatViewProvider {
         contextBudgetTokens: cfg.contextBudgetTokens,
         memoryNotes,
         openFile,
+        selection,
         planMode,
         signal: this.abortController.signal,
         ctx: {

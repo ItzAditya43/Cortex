@@ -167,6 +167,37 @@ function activate(context) {
       vscode.window.showInformationMessage(`Cortex profile: ${provider.activeProfile || '(none)'}`);
     })
   );
+
+  // Right-click-on-selection commands, matching Claude Code's editor context
+  // menu: "Add to Cortex" stages a reference to the highlighted code in the
+  // composer for the user to add their own instruction, "Ask Cortex" sends
+  // a canned explain-this request immediately.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cortex.addSelectionToChat', async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || editor.selection.isEmpty) {
+        vscode.window.showWarningMessage('Select some code first.');
+        return;
+      }
+      const file = vscode.workspace.asRelativePath(editor.document.uri);
+      const startLine = editor.selection.start.line + 1;
+      const endLine = editor.selection.end.line + 1;
+      await vscode.commands.executeCommand('workbench.view.extension.cortex');
+      provider.post({ type: 'insertText', text: `Re: ${file}:${startLine}-${endLine} — ` });
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cortex.explainSelection', async () => {
+      const editor = vscode.window.activeTextEditor;
+      if (!editor || editor.selection.isEmpty) {
+        vscode.window.showWarningMessage('Select some code first.');
+        return;
+      }
+      await vscode.commands.executeCommand('workbench.view.extension.cortex');
+      await provider.onSend('Explain the selected code and what it does.');
+    })
+  );
 }
 
 function formatSize(bytes) {

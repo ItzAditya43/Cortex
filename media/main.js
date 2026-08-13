@@ -623,6 +623,11 @@
         bannerEl.textContent = msg.text;
         bannerEl.classList.remove('hidden');
         break;
+      case 'insertText':
+        inputEl.value = msg.text + (inputEl.value ? '\n' + inputEl.value : '');
+        inputEl.focus();
+        inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+        break;
       case 'userMessage':
         addUserMessage(msg.text);
         break;

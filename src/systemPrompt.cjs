@@ -50,11 +50,16 @@ function loadProjectRules(cwd, openFile) {
 // a handful of models. This protocol works with *any* instruction-following
 // model — quality of tool use scales with model strength, but the mechanism
 // itself is universal.
-function buildSystemPrompt({ memoryNotes, cwd, openFile, planMode }) {
+function buildSystemPrompt({ memoryNotes, cwd, openFile, planMode, selection }) {
   const projectRules = loadProjectRules(cwd, openFile);
   return `You are Cortex, an autonomous coding assistant embedded in VS Code, similar in spirit to Cline/Claude Code, but running entirely on local models via Ollama. You read, write, edit, and run code directly inside the user's open workspace at:
 ${cwd}
 ${openFile ? `\nThe user currently has this file open in the editor: ${openFile}\n` : ''}
+${
+  selection && selection.text
+    ? `\nThe user currently has this exact text selected/highlighted in ${selection.file || openFile || 'the editor'} (lines ${selection.startLine}-${selection.endLine}). Treat it as the primary subject of their request unless they clearly mean something else:\n\`\`\`\n${selection.text}\n\`\`\`\n`
+    : ''
+}
 ${planMode ? `\nCURRENT MODE: PLAN MODE. You are in a read-only investigation/discussion mode. write_file, edit_file, and run_command are disabled and will return an error if called. Use read_file, list_dir, and search_code freely to understand the codebase, then respond in plain text with a clear, concrete plan (files to change, approach, tradeoffs). Do not pretend to make changes. Wait for the user to switch you to Act Mode before anything gets written.\n` : ''}
 TOOL PROTOCOL (read carefully):
 To use a tool, your ENTIRE response must be a single line of the form:

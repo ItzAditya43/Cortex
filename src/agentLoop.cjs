@@ -106,6 +106,7 @@ function parseToolCall(text) {
  * @param {number} opts.maxSteps
  * @param {string} opts.memoryNotes
  * @param {string} [opts.openFile]
+ * @param {{text: string, file?: string, startLine?: number, endLine?: number}} [opts.selection] currently highlighted editor text, if any
  * @param {boolean} [opts.planMode]       when true, mutating tools (write_file/edit_file/run_command) are blocked
  * @param {number} [opts.contextBudgetTokens] rough token budget for history sent per turn (see contextManager.cjs)
  * @param {object} [opts.ctx]            passed through as tool.run's 3rd argument (webhook url, delegation config, etc.)
@@ -131,6 +132,7 @@ async function runTurn(opts) {
     maxSteps,
     memoryNotes,
     openFile,
+    selection,
     planMode,
     contextBudgetTokens = DEFAULT_BUDGET_TOKENS,
     ctx,
@@ -152,7 +154,7 @@ async function runTurn(opts) {
     steps++;
 
     const activeModel = pickModel({ model, fastModel, usedMutatingTool, isFirstStep: steps === 1 });
-    const system = buildSystemPrompt({ memoryNotes, cwd: root, openFile, planMode });
+    const system = buildSystemPrompt({ memoryNotes, cwd: root, openFile, planMode, selection });
     const messages = buildContextMessages(system, history, contextBudgetTokens);
     onLog?.(`step ${steps}: sending ${messages.length} message(s) to ${activeModel}${activeModel !== model ? ' (routed: fast)' : ''} (budget ${contextBudgetTokens} tok)`);
 
