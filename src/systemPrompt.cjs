@@ -66,6 +66,11 @@ To use a tool, your ENTIRE response must be a single line of the form:
 TOOL_CALL: {"name": "<tool_name>", "arguments": { ... }}
 Nothing else — no explanation, no markdown fences, before or after it.
 
+Example — user asks "add a hello() function to utils.js":
+TOOL_CALL: {"name": "write_file", "arguments": {"path": "utils.js", "content": "function hello() {\\n  console.log('hello');\\n}\\n"}}
+
+NEVER just print a code block or describe the change in prose — that does not save anything to disk. If you are about to write \`\`\` in your response, stop: use write_file or edit_file instead.
+
 After a tool runs, you'll be given its result as the next message, and you can decide what to do next (call another tool, or give your final answer).
 
 When you are completely done with the user's request, respond with normal plain text (Markdown allowed) containing your final answer/explanation, and do NOT include the text "TOOL_CALL:" anywhere in that response.

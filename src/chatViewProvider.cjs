@@ -383,6 +383,24 @@ class ChatViewProvider {
     await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `${entry.path} (proposed change)`);
   }
 
+  // Auto-opens the diff for a just-applied file change in the main editor
+  // pane, reusing one tab (preview: true) and not stealing focus from the
+  // chat input (preserveFocus: true) so a long agent run doesn't spam tabs
+  // or yank the cursor away every step.
+  async showDiffLive(snapshot, callId) {
+    this.diffProvider.store(callId, snapshot);
+    const leftUri = vscode.Uri.parse(`cortex-diff:${callId}/before/${encodeURIComponent(snapshot.path)}`);
+    const rightUri = vscode.Uri.parse(`cortex-diff:${callId}/after/${encodeURIComponent(snapshot.path)}`);
+    try {
+      await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `${snapshot.path} (Cortex edit)`, {
+        preview: true,
+        preserveFocus: true,
+      });
+    } catch {
+      // best-effort — never let a display glitch break the agent turn
+    }
+  }
+
   async revertChange(callId) {
     const root = this.root;
     const snapshot = this.revertable.get(callId);
@@ -645,6 +663,10 @@ class ChatViewProvider {
             revertAvailable: !!snapshot,
             diff: !alreadyShown && snapshot ? { path: snapshot.path, before: snapshot.before, after: snapshot.after } : null,
           });
+          // Live preview: pop the diff for every successful file write/edit
+          // straight into the editor pane as it happens, instead of making
+          // the user hunt for it in the chat panel afterwards.
+          if (snapshot && callId && !isError) this.showDiffLive(snapshot, callId);
         },
         onFinal: (finalText, steps) => {
           this.post({ type: 'final', text: finalText, steps, elapsedMs: Date.now() - startedAt });

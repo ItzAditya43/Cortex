@@ -148,6 +148,7 @@ async function runTurn(opts) {
 
   let steps = 0;
   let usedMutatingTool = false;
+  let codeFenceNudged = false;
 
   while (steps < maxSteps) {
     if (signal?.aborted) return;
@@ -171,6 +172,20 @@ async function runTurn(opts) {
     const parsed = parseToolCall(reply);
 
     if (!parsed.attempted) {
+      // Small models frequently "explain" a change with a fenced code block
+      // instead of actually calling write_file/edit_file — nothing gets
+      // saved to disk even though the response looks like it did the work.
+      // Give one nudge back before accepting it as a genuine final answer.
+      if (/```/.test(reply) && !codeFenceNudged) {
+        codeFenceNudged = true;
+        history.push({ role: 'assistant', content: reply });
+        history.push({
+          role: 'user',
+          content:
+            'TOOL_RESULT: You printed a code block instead of calling a tool, so nothing was saved. If you intended to change a file, respond with TOOL_CALL: {"name": "write_file"|"edit_file", "arguments": {...}} instead. If you were just showing an example/explanation with no file change intended, say so in plain text without any ``` fences.',
+        });
+        continue;
+      }
       history.push({ role: 'assistant', content: reply });
       onFinal(reply.trim(), steps);
       return;

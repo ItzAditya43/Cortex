@@ -25,15 +25,37 @@ function sleep(ms) {
  * @returns {Promise<string>} the full assistant message content
  */
 async function chat({ host, model, messages, temperature = 0.2, onToken, signal, logFn }) {
+  // Idle watchdog: if the model stalls mid-generation (no bytes for 90s —
+  // common with an overloaded/hung local model), abort instead of hanging
+  // the whole turn forever with the UI stuck on "busy" and no way out.
+  // Cancelling the response body stream directly after the fact throws
+  // ("ReadableStream is locked") once a `for await` is reading it — the
+  // fetch has to be given its own AbortController up front so aborting it
+  // is what actually unblocks the read.
+  const IDLE_TIMEOUT_MS = 90_000;
+  const idleController = new AbortController();
+  const onOuterAbort = () => idleController.abort(signal.reason);
+  signal?.addEventListener('abort', onOuterAbort);
+  let idleTimer;
+  let timedOut = false;
+  const resetIdleTimer = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      timedOut = true;
+      idleController.abort();
+    }, IDLE_TIMEOUT_MS);
+  };
+
   let res;
   let connectErr;
   for (let attempt = 0; attempt <= CONNECT_RETRIES; attempt++) {
     try {
+      resetIdleTimer();
       res = await fetch(`${host}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model, messages, stream: true, options: { temperature } }),
-        signal,
+        signal: idleController.signal,
       });
       connectErr = null;
       break;
@@ -70,31 +92,44 @@ async function chat({ host, model, messages, temperature = 0.2, onToken, signal,
 
   let full = '';
   let buf = '';
-  for await (const bytes of res.body) {
-    buf += Buffer.isBuffer(bytes) ? bytes.toString('utf8') : Buffer.from(bytes).toString('utf8');
-    let nl;
-    while ((nl = buf.indexOf('\n')) !== -1) {
-      const line = buf.slice(0, nl).trim();
-      buf = buf.slice(nl + 1);
-      if (!line) continue;
-      let obj;
-      try {
-        obj = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (obj.message?.content) {
-        full += obj.message.content;
-        if (onToken) onToken(obj.message.content);
-      }
-      if (obj.done) {
-        logFn?.(`response ${full.length} chars (streamed)`);
-        return full;
+
+  try {
+    for await (const bytes of res.body) {
+      resetIdleTimer();
+      buf += Buffer.isBuffer(bytes) ? bytes.toString('utf8') : Buffer.from(bytes).toString('utf8');
+      let nl;
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let obj;
+        try {
+          obj = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (obj.message?.content) {
+          full += obj.message.content;
+          if (onToken) onToken(obj.message.content);
+        }
+        if (obj.done) {
+          logFn?.(`response ${full.length} chars (streamed)`);
+          return full;
+        }
       }
     }
+    if (timedOut) {
+      throw Object.assign(new Error(`Ollama stopped responding (no output for ${IDLE_TIMEOUT_MS / 1000}s)`), { name: 'AbortError' });
+    }
+    if (signal?.aborted) {
+      throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+    }
+    logFn?.(`response ${full.length} chars (stream ended without done:true)`);
+    return full;
+  } finally {
+    clearTimeout(idleTimer);
+    signal?.removeEventListener('abort', onOuterAbort);
   }
-  logFn?.(`response ${full.length} chars (stream ended without done:true)`);
-  return full;
 }
 
 /**

@@ -260,6 +260,7 @@ body {
 /* ---------- messages ---------- */
 #messages {
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 12px 10px;
   display: flex;
