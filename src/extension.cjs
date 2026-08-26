@@ -20,6 +20,27 @@ function activate(context) {
 
   const initialCfg = vscode.workspace.getConfiguration('cortex');
   startMcpServers(initialCfg.get('mcpServers') || [], (m) => logger.log(m));
+
+  // First-run/every-launch connectivity check: fail fast and helpfully
+  // rather than letting the user type a message into what looks like a
+  // working chat panel, only to hit a confusing "could not reach" error
+  // after they've already invested effort composing the request.
+  if ((initialCfg.get('provider') || 'ollama') === 'ollama') {
+    const host = initialCfg.get('host');
+    listModels({ host, provider: 'ollama' })
+      .then((models) => {
+        if (models.length === 0) {
+          vscode.window
+            .showWarningMessage(`Cortex: connected to Ollama at ${host}, but no models are pulled yet.`, 'Select Model')
+            .then((choice) => choice && vscode.commands.executeCommand('cortex.selectModel'));
+        }
+      })
+      .catch(() => {
+        vscode.window
+          .showWarningMessage(`Cortex: could not reach Ollama at ${host}. Is "ollama serve" running?`, 'Open Settings')
+          .then((choice) => choice && vscode.commands.executeCommand('workbench.action.openSettings', 'cortex.host'));
+      });
+  }
   startScheduler({
     getSchedules: () => vscode.workspace.getConfiguration('cortex').get('schedules') || [],
     getRunConfig: () => {

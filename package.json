@@ -177,6 +177,16 @@
           "default": "",
           "description": "Optional smaller/faster model used for read-only investigation steps (read_file, list_dir, search_code) — the main model is used once the agent needs to write code or run commands. Leave empty to always use the main model."
         },
+        "cortex.escalateModel": {
+          "type": "string",
+          "default": "",
+          "description": "Optional stronger model (e.g. a cloud model like minimax-m3:cloud) to switch to after 2 consecutive tool failures/syntax errors in a turn — lets a small default model \"call for help\" instead of repeating the same mistake. Leave empty to disable."
+        },
+        "cortex.testCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Command to run automatically once per turn after the agent edits files (e.g. \"npm test\"). If it fails, the failure is fed back to the model for one fix attempt before the turn ends. Leave empty to disable."
+        },
         "cortex.approveForMe": {
           "type": "boolean",
           "default": false,

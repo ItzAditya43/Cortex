@@ -7,6 +7,7 @@
   const stopBtn = document.getElementById('stop-btn');
   const bannerEl = document.getElementById('banner');
   const modelBadge = document.getElementById('model-badge');
+  const sessionStatsEl = document.getElementById('session-stats');
   const historyBtn = document.getElementById('history-btn');
   const approvalsBtn = document.getElementById('approvals-btn');
   const memoryBtn = document.getElementById('memory-btn');
@@ -19,6 +20,15 @@
   let currentAssistantEl = null; // streaming bubble currently being written to
   let currentAssistantBuf = '';
   let busy = false;
+  const sessionStats = { toolCalls: 0, totalMs: 0 };
+  function renderSessionStats() {
+    if (!sessionStatsEl) return;
+    if (!sessionStats.toolCalls && !sessionStats.totalMs) {
+      sessionStatsEl.textContent = '';
+      return;
+    }
+    sessionStatsEl.textContent = `${sessionStats.toolCalls} call${sessionStats.toolCalls === 1 ? '' : 's'} · ${(sessionStats.totalMs / 1000).toFixed(1)}s`;
+  }
 
   // ---------- tiny, dependency-free markdown renderer ----------
   // Supports: fenced code blocks, inline code, bold/italic, headings,
@@ -148,11 +158,21 @@
     if (el) el.remove();
   }
 
-  function addUserMessage(text) {
+  function addUserMessage(text, image) {
     clearEmptyState();
     const div = document.createElement('div');
     div.className = 'msg user';
-    div.textContent = text;
+    if (image) {
+      const img = document.createElement('img');
+      img.src = image;
+      img.className = 'msg-attached-image';
+      div.appendChild(img);
+    }
+    if (text) {
+      const span = document.createElement('span');
+      span.textContent = text;
+      div.appendChild(span);
+    }
     messagesEl.appendChild(div);
     currentAssistantEl = null;
     currentAssistantBuf = '';
@@ -416,11 +436,45 @@
     inputEl.disabled = value;
   }
 
+  let pendingImage = null; // data: URL of an attached image, cleared after send
+
   function send() {
     const text = inputEl.value;
-    if (!text.trim() || busy) return;
+    if ((!text.trim() && !pendingImage) || busy) return;
     inputEl.value = '';
-    vscode.postMessage({ type: 'send', text });
+    const image = pendingImage;
+    clearPendingImage();
+    vscode.postMessage({ type: 'send', text, image });
+  }
+
+  function clearPendingImage() {
+    pendingImage = null;
+    const chip = document.getElementById('image-chip');
+    if (chip) chip.remove();
+  }
+
+  function setPendingImage(dataUrl) {
+    clearPendingImage(); // remove any previous chip first
+    pendingImage = dataUrl;
+    const chip = document.createElement('div');
+    chip.id = 'image-chip';
+    chip.innerHTML = `<img src="${dataUrl}"><button title="Remove">×</button>`;
+    chip.querySelector('button').onclick = () => clearPendingImage();
+    document.getElementById('composer').insertBefore(chip, inputEl);
+  }
+
+  const imageInput = document.getElementById('image-input');
+  const attachBtn = document.getElementById('attach-btn');
+  if (attachBtn && imageInput) {
+    attachBtn.addEventListener('click', () => imageInput.click());
+    imageInput.addEventListener('change', () => {
+      const file = imageInput.files && imageInput.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => setPendingImage(reader.result);
+      reader.readAsDataURL(file);
+      imageInput.value = '';
+    });
   }
 
   sendBtn.addEventListener('click', send);
@@ -643,14 +697,24 @@
         inputEl.focus();
         inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
         break;
+      case 'testRun': {
+        const div = document.createElement('div');
+        div.className = 'msg system' + (msg.failed ? ' test-fail' : ' test-pass');
+        div.textContent = `${msg.failed ? '✗' : '✓'} ${msg.command}\n${msg.result.slice(0, 400)}`;
+        messagesEl.appendChild(div);
+        scrollToBottom();
+        break;
+      }
       case 'userMessage':
-        addUserMessage(msg.text);
+        addUserMessage(msg.text, msg.image);
         break;
       case 'token':
         appendToken(msg.text);
         break;
       case 'toolCall':
         addToolCall(msg.name, msg.args, msg.id);
+        sessionStats.toolCalls++;
+        renderSessionStats();
         break;
       case 'needsApproval':
         addApprovalUI(msg.id, msg.name, msg.args, msg.preview, msg.diffId);
@@ -663,6 +727,8 @@
         break;
       case 'final':
         finalizeAssistant(msg.text, msg.steps, msg.elapsedMs);
+        sessionStats.totalMs += msg.elapsedMs || 0;
+        renderSessionStats();
         break;
       case 'error':
         addSystemNote(`⚠ ${msg.text}`);

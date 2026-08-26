@@ -101,6 +101,8 @@ class ChatViewProvider {
       host: c.get('host'),
       model: c.get('model'),
       fastModel: c.get('fastModel') || '',
+      escalateModel: c.get('escalateModel') || '',
+      testCommand: c.get('testCommand') || '',
       provider: c.get('provider') || 'ollama',
       apiKey: c.get('apiKey') || '',
       autoApprove: c.get('autoApprove'),
@@ -189,9 +191,12 @@ class ChatViewProvider {
   <div id="banner" class="hidden"></div>
   <div id="messages"></div>
   <div id="composer">
+    <input type="file" id="image-input" accept="image/*" class="hidden">
     <textarea id="input" placeholder="Ask Cortex to do something in this workspace..." rows="3"></textarea>
     <div id="composer-row">
+      <button id="attach-btn" title="Attach an image (vision model required)" aria-label="Attach image">📎</button>
       <span id="model-badge">${escapeHtml(cfg.model)}</span>
+      <span id="session-stats" title="This session: tool calls / total time"></span>
       <span class="spacer"></span>
       <button id="stop-btn" class="hidden">Stop</button>
       <button id="send-btn">Send</button>
@@ -221,7 +226,7 @@ class ChatViewProvider {
         break;
       }
       case 'send':
-        await this.onSend(msg.text);
+        await this.onSend(msg.text, msg.image);
         break;
       case 'stop':
         this.abortController?.abort();
@@ -424,7 +429,7 @@ class ChatViewProvider {
   // rejected with a message) so onSend can stop instead of treating it as a
   // normal chat message.
   async handleSlashCommand(text) {
-    const trimmed = text.trim();
+    const trimmed = (text || '').trim();
     if (!trimmed.startsWith('/')) return false;
     const [cmd] = trimmed.slice(1).split(/\s+/);
     const root = this.root;
@@ -538,26 +543,33 @@ class ChatViewProvider {
     }
   }
 
-  async onSend(text) {
-    if (!text || !text.trim()) return;
+  async onSend(text, image) {
+    if ((!text || !text.trim()) && !image) return;
     const root = this.root;
     if (!root) {
       this.post({ type: 'banner', text: 'Open a folder/workspace to start using Cortex.' });
       return;
     }
     if (this.busy) return;
-    this.post({ type: 'userMessage', text });
+    this.post({ type: 'userMessage', text, image });
     if (await this.handleSlashCommand(text)) return;
 
     this.busy = true;
     this.abortController = new AbortController();
     this.post({ type: 'busy', value: true });
 
-    this.history.push({ role: 'user', content: text });
+    // Ollama's /api/chat accepts an `images` field (base64, no data: prefix)
+    // on a message for vision-capable models (llava, qwen2.5-vl, etc.) —
+    // history messages pass through buildContextMessages/provider.cjs
+    // untouched, so attaching it here is all that's needed for the rest of
+    // the pipeline to carry it through.
+    const userMsg = { role: 'user', content: text || '(see attached image)' };
+    if (image) userMsg.images = [image.replace(/^data:[^,]+,/, '')];
+    this.history.push(userMsg);
 
     const cfg = this.cfg();
     logger.log(
-      `session=${this.sessionId} mode=${this.mode} model=${cfg.model} user message (${text.length} chars): ${text.slice(0, 120)}`
+      `session=${this.sessionId} mode=${this.mode} model=${cfg.model} user message (${(text || '').length} chars${image ? ' + image' : ''}): ${(text || '').slice(0, 120)}`
     );
     let memoryNotes = loadMemoryNotes(root);
     if (cfg.provider !== 'openai-compatible') {
@@ -592,6 +604,9 @@ class ChatViewProvider {
         apiKey: cfg.apiKey,
         model: cfg.model,
         fastModel: cfg.fastModel,
+        escalateModel: cfg.escalateModel,
+        testCommand: cfg.testCommand,
+        onTestRun: (cmd, result, failed) => this.post({ type: 'testRun', command: cmd, result, failed }),
         temperature: cfg.temperature,
         maxSteps: cfg.maxSteps,
         contextBudgetTokens: cfg.contextBudgetTokens,

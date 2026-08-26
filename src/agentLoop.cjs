@@ -128,6 +128,7 @@ async function runTurn(opts) {
     apiKey,
     model,
     fastModel,
+    escalateModel,
     temperature,
     maxSteps,
     memoryNotes,
@@ -135,6 +136,8 @@ async function runTurn(opts) {
     selection,
     planMode,
     contextBudgetTokens = DEFAULT_BUDGET_TOKENS,
+    testCommand,
+    onTestRun,
     ctx,
     signal,
     onToken,
@@ -149,15 +152,23 @@ async function runTurn(opts) {
   let steps = 0;
   let usedMutatingTool = false;
   let codeFenceNudged = false;
+  let testRan = false;
+  let consecutiveFailures = 0;
 
   while (steps < maxSteps) {
     if (signal?.aborted) return;
     steps++;
 
-    const activeModel = pickModel({ model, fastModel, usedMutatingTool, isFirstStep: steps === 1 });
+    // If the same tool call has failed (or produced a syntax-broken edit)
+    // twice in a row, the small/fast model is probably stuck — escalate to
+    // a stronger model for the next attempt instead of retrying the same
+    // mistake indefinitely.
+    const escalating = !!escalateModel && escalateModel !== model && consecutiveFailures >= 2;
+    const activeModel = escalating ? escalateModel : pickModel({ model, fastModel, usedMutatingTool, isFirstStep: steps === 1 });
+    const routedLabel = escalating ? ' (escalated after repeated failures)' : activeModel !== model ? ' (routed: fast)' : '';
     const system = buildSystemPrompt({ memoryNotes, cwd: root, openFile, planMode, selection });
     const messages = buildContextMessages(system, history, contextBudgetTokens);
-    onLog?.(`step ${steps}: sending ${messages.length} message(s) to ${activeModel}${activeModel !== model ? ' (routed: fast)' : ''} (budget ${contextBudgetTokens} tok)`);
+    onLog?.(`step ${steps}: sending ${messages.length} message(s) to ${activeModel}${routedLabel} (budget ${contextBudgetTokens} tok)`);
 
     let reply;
     try {
@@ -186,6 +197,27 @@ async function runTurn(opts) {
         });
         continue;
       }
+      // Before accepting a final answer, if this turn actually changed
+      // files, give the project's own test command one chance to catch
+      // what pre-diff syntax verification can't (logic errors, broken
+      // integration) — same idea as Claude Code running tests after edits,
+      // instead of trusting the model's own "this should work now".
+      if (usedMutatingTool && testCommand && !testRan && steps < maxSteps) {
+        testRan = true;
+        onLog?.(`step ${steps}: turn modified files — running test command: ${testCommand}`);
+        const testResult = await tools.run_command.run({ command: testCommand }, root, ctx);
+        const failed = /^ERROR|EXIT CODE: [1-9]/.test(testResult);
+        onTestRun?.(testCommand, testResult, failed);
+        if (failed) {
+          history.push({ role: 'assistant', content: reply });
+          history.push({
+            role: 'user',
+            content: `TOOL_RESULT: Your changes were made, but running the test command ("${testCommand}") failed:\n${testResult}\n\nFix the failure, or explain to the user why it's expected/unrelated.`,
+          });
+          continue;
+        }
+        onLog?.(`step ${steps}: tests passed`);
+      }
       history.push({ role: 'assistant', content: reply });
       onFinal(reply.trim(), steps);
       return;
@@ -197,6 +229,7 @@ async function runTurn(opts) {
       const msg = `ERROR: your TOOL_CALL JSON was invalid (${parsed.error}). Respond again with a single valid TOOL_CALL: {...} line, making sure all string values properly escape newlines as \\n.`;
       history.push({ role: 'user', content: `TOOL_RESULT: ${msg}` });
       onToolResult(msg, true, null);
+      consecutiveFailures++;
       continue;
     }
 
@@ -280,6 +313,7 @@ async function runTurn(opts) {
     if (!isError && verification && verification.ok === false) {
       result += `\n\nSYNTAX WARNING: the file you just wrote does not parse. Details: ${verification.message}\nFix this before moving on — either re-read the file and correct it, or explain the issue to the user.`;
     }
+    consecutiveFailures = isError || (verification && verification.ok === false) ? consecutiveFailures + 1 : 0;
 
     history.push({ role: 'user', content: `TOOL_RESULT:\n${result}` });
     onLog?.(`step ${steps}: tool result [${callId}] ${isError ? 'ERROR' : 'ok'} (${String(result).length} chars)`);

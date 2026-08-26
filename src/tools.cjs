@@ -362,6 +362,96 @@ const tools = {
       }
     },
   },
+
+  multi_edit: {
+    description:
+      'Apply several edit_file-style patches (possibly across different files) as one atomic operation — either all succeed or none are written. Use this instead of several edit_file calls when a change spans multiple files, to avoid leaving the codebase half-edited if a later patch fails. Arguments: {"edits": [{"path": string, "old_str": string, "new_str": string}, ...]}',
+    confirm: true,
+    kind: 'edit',
+    preview: ({ edits }, root) => {
+      if (!Array.isArray(edits) || edits.length === 0) return { path: '(multi_edit)', error: 'edits must be a non-empty array' };
+      const summaries = [];
+      for (const e of edits) {
+        const full = safePath(root, e.path);
+        if (!fs.existsSync(full)) return { path: e.path, error: `file not found: ${e.path}` };
+        const before = fs.readFileSync(full, 'utf8');
+        const count = before.split(e.old_str || '').length - 1;
+        if (!e.old_str) return { path: e.path, error: `old_str empty for ${e.path}` };
+        if (count === 0) return { path: e.path, error: `old_str not found in ${e.path}` };
+        if (count > 1) return { path: e.path, error: `old_str matches ${count} places in ${e.path}, needs more context` };
+        summaries.push(`${e.path}: 1 change`);
+      }
+      return { path: `${edits.length} file(s)`, before: '', after: summaries.join('\n') };
+    },
+    run: ({ edits }, root) => {
+      if (!Array.isArray(edits) || edits.length === 0) return 'ERROR: edits must be a non-empty array';
+      // Validate every patch applies cleanly before writing anything, so a
+      // failure partway through never leaves some files edited and others not.
+      const planned = [];
+      for (const e of edits) {
+        let full;
+        try {
+          full = safePath(root, e.path);
+        } catch (err) {
+          return `ERROR: ${err.message}`;
+        }
+        if (!fs.existsSync(full)) return `ERROR: file not found: ${e.path} (no files were changed)`;
+        const before = fs.readFileSync(full, 'utf8');
+        if (!e.old_str) return `ERROR: old_str empty for ${e.path} (no files were changed)`;
+        const count = before.split(e.old_str).length - 1;
+        if (count === 0) return `ERROR: old_str not found in ${e.path} (no files were changed)`;
+        if (count > 1) return `ERROR: old_str matches ${count} places in ${e.path}, needs more context (no files were changed)`;
+        planned.push({ full, path: e.path, after: before.replace(e.old_str, e.new_str ?? '') });
+      }
+      for (const p of planned) fs.writeFileSync(p.full, p.after);
+      return `OK: applied ${planned.length} edit(s) across ${new Set(planned.map((p) => p.path)).size} file(s): ${planned.map((p) => p.path).join(', ')}`;
+    },
+  },
+
+  find_symbol: {
+    description:
+      'Find where a function/class/const/variable named `name` is DEFINED (not just mentioned) — greps for common declaration patterns (function/class/const/let/def/interface/type) across the workspace. Faster and more precise than search_code when you know the symbol name. Arguments: {"name": string, "path": string (optional, default ".")}',
+    confirm: false,
+    readOnly: true,
+    run: ({ name, path: p }, root) => {
+      if (!name) return 'ERROR: name is required';
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pattern = `(function|class|const|let|var|def|interface|type|struct|fn)\\s+${escaped}\\b|${escaped}\\s*[:=]\\s*(function|\\(|async)`;
+      try {
+        const dir = safePath(root, p || '.');
+        const out = execSync(
+          `grep -rnE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.cortex -- ${JSON.stringify(pattern)} ${JSON.stringify(dir)}`,
+          { encoding: 'utf8', maxBuffer: 1024 * 1024 * 10 }
+        );
+        return truncate(out || `(no definition found for "${name}")`);
+      } catch (err) {
+        if (err.status === 1) return `(no definition found for "${name}")`;
+        return `ERROR: ${err.message}`;
+      }
+    },
+  },
+
+  find_references: {
+    description:
+      'Find every place `name` is USED/referenced across the workspace (all mentions, not just the definition) — use after find_symbol to see callers/usages before changing or removing something. Arguments: {"name": string, "path": string (optional, default ".")}',
+    confirm: false,
+    readOnly: true,
+    run: ({ name, path: p }, root) => {
+      if (!name) return 'ERROR: name is required';
+      try {
+        const dir = safePath(root, p || '.');
+        const out = execSync(
+          `grep -rn --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.cortex -w -- ${JSON.stringify(name)} ${JSON.stringify(dir)}`,
+          { encoding: 'utf8', maxBuffer: 1024 * 1024 * 10 }
+        );
+        const lines = (out || '').trim().split('\n').filter(Boolean);
+        return truncate(lines.length ? `${lines.length} reference(s):\n${lines.join('\n')}` : `(no references found for "${name}")`);
+      } catch (err) {
+        if (err.status === 1) return `(no references found for "${name}")`;
+        return `ERROR: ${err.message}`;
+      }
+    },
+  },
 };
 
 function toolListForPrompt() {

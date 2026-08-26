@@ -311,6 +311,16 @@ body {
   padding: 4px 12px;
   align-self: center;
 }
+.msg.system.test-pass, .msg.system.test-fail {
+  align-self: stretch;
+  font-style: normal;
+  white-space: pre-wrap;
+  padding: 8px 10px;
+  border-radius: var(--cortex-radius-sm);
+  font-family: var(--vscode-editor-font-family, monospace);
+}
+.msg.system.test-pass { background: rgba(0, 194, 168, 0.1); color: var(--cortex-accent); }
+.msg.system.test-fail { background: var(--vscode-inputValidation-errorBackground); color: var(--vscode-errorForeground); }
 
 /* markdown rendering inside assistant bubbles */
 .msg.assistant { white-space: normal; }
@@ -473,6 +483,29 @@ body {
   border-top: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
   padding: 10px;
   background: color-mix(in srgb, var(--vscode-sideBar-background) 92%, var(--cortex-accent) 8%);
+}
+
+#image-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+#image-chip img { height: 40px; border-radius: 4px; object-fit: cover; }
+#image-chip button {
+  background: none;
+  border: none;
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+.msg-attached-image {
+  max-width: 100%;
+  max-height: 220px;
+  border-radius: var(--cortex-radius-sm);
+  display: block;
+  margin-bottom: 6px;
 }
 
 #input {
