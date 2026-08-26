@@ -266,6 +266,21 @@
   }
 
   function addToolCall(name, args, id) {
+    // The streaming bubble was filled live with the model's raw output,
+    // which includes the literal "TOOL_CALL: {...}" line now being replaced
+    // by the clean card below — left as-is it duplicates as ugly raw JSON
+    // text in the transcript. Keep any real commentary the model wrote
+    // before the marker, discard the rest.
+    if (currentAssistantEl) {
+      const idx = currentAssistantBuf.indexOf('TOOL_CALL:');
+      const commentary = (idx === -1 ? currentAssistantBuf : currentAssistantBuf.slice(0, idx)).trim();
+      if (commentary) {
+        currentAssistantEl.innerHTML = renderMarkdown(commentary);
+        bindLinks(currentAssistantEl);
+      } else {
+        currentAssistantEl.remove();
+      }
+    }
     currentAssistantEl = null;
     currentAssistantBuf = '';
     const block = document.createElement('div');
