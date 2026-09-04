@@ -24,7 +24,7 @@ function sleep(ms) {
  * @param {(message: string) => void} [opts.logFn] optional diagnostic sink — never throws, never required
  * @returns {Promise<string>} the full assistant message content
  */
-async function chat({ host, model, messages, temperature = 0.2, onToken, signal, logFn }) {
+async function chat({ host, model, messages, temperature = 0.2, onToken, onUsage, signal, logFn }) {
   // Idle watchdog: if the model stalls mid-generation (no bytes for 90s —
   // common with an overloaded/hung local model), abort instead of hanging
   // the whole turn forever with the UI stuck on "busy" and no way out.
@@ -113,6 +113,16 @@ async function chat({ host, model, messages, temperature = 0.2, onToken, signal,
           if (onToken) onToken(obj.message.content);
         }
         if (obj.done) {
+          // Ollama reports real token counts on the final chunk; surfacing
+          // them is the only way the UI can show context utilisation rather
+          // than guessing from a chars/4 heuristic.
+          if (onUsage && (obj.prompt_eval_count || obj.eval_count)) {
+            onUsage({
+              promptTokens: obj.prompt_eval_count || 0,
+              completionTokens: obj.eval_count || 0,
+              totalDurationMs: obj.total_duration ? Math.round(obj.total_duration / 1e6) : 0,
+            });
+          }
           logFn?.(`response ${full.length} chars (streamed)`);
           return full;
         }

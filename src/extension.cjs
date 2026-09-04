@@ -5,6 +5,8 @@ const { ChatViewProvider, DiffContentProvider } = require('./chatViewProvider.cj
 const { listModels } = require('./provider.cjs');
 const { startScheduler, stopScheduler } = require('./scheduler.cjs');
 const { startMcpServers, stopMcpServers } = require('./mcpManager.cjs');
+const codeIndex = require('./codeIndex.cjs');
+const terminalIntegration = require('./terminal.cjs');
 const logger = require('./logger.cjs');
 
 function activate(context) {
@@ -15,6 +17,7 @@ function activate(context) {
       logger.log('Cortex deactivating.');
       stopMcpServers();
       stopScheduler();
+      terminalIntegration.dispose();
     },
   });
 
@@ -165,6 +168,35 @@ function activate(context) {
       if (picked) {
         await c.update('model', picked.label, vscode.ConfigurationTarget.Global);
       }
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cortex.buildCodeIndex', async () => {
+      const c = vscode.workspace.getConfiguration('cortex');
+      const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!root) {
+        vscode.window.showWarningMessage('Cortex: open a folder first.');
+        return;
+      }
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Cortex: indexing codebase', cancellable: false },
+        async (progress) => {
+          try {
+            const stats = await codeIndex.buildIndex(root, {
+              host: c.get('host'),
+              onProgress: (done, total) => progress.report({ message: `${done} chunk(s) embedded` }),
+            });
+            vscode.window.showInformationMessage(
+              `Cortex: indexed ${stats.files} file(s), ${stats.chunks} chunk(s) (${stats.embedded} new, ${stats.reused} reused).`
+            );
+          } catch (err) {
+            vscode.window.showErrorMessage(
+              `Cortex: indexing failed (${err.message}). Pull an embedding model first: "ollama pull nomic-embed-text".`
+            );
+          }
+        }
+      );
     })
   );
 

@@ -16,6 +16,9 @@ const { indexNote } = require('./semanticMemory.cjs');
 const { wrapCommand } = require('./sandbox.cjs');
 const { markAgentRead, markAgentWrite } = require('./fileTracker.cjs');
 const { saveTasks, taskProgress } = require('./taskList.cjs');
+const lsp = require('./lsp.cjs');
+const codeIndex = require('./codeIndex.cjs');
+const terminal = require('./terminal.cjs');
 
 const MAX_RESULT_CHARS = 8000;
 
@@ -222,8 +225,25 @@ const tools = {
     description: 'Run a shell command in the workspace root (e.g. tests, linters, git, build steps) and return stdout/stderr. Arguments: {"command": string}',
     confirm: true,
     kind: 'command',
-    run: ({ command }, root, ctx) => {
+    run: async ({ command }, root, ctx) => {
       if (!command) return 'ERROR: command is required';
+      // Prefer VS Code's visible terminal so the user can watch (and keep)
+      // what ran. Sandboxed commands deliberately stay on the child-process
+      // path — bubblewrap wrapping is what provides the containment, and it
+      // doesn't compose with the shell-integration wrapper.
+      if (ctx?.useTerminal && ctx?.sandboxMode !== 'workspace-write') {
+        try {
+          const res = await terminal.runInTerminal(command, root);
+          if (res) {
+            const failed = res.exitCode !== undefined && res.exitCode !== 0;
+            return truncate(
+              `${failed ? `EXIT CODE: ${res.exitCode}\n` : ''}${res.output || '(command produced no output)'}`
+            );
+          }
+        } catch {
+          // fall through to the child-process path below
+        }
+      }
       const { command: toRun, sandboxed } = ctx?.sandboxMode === 'workspace-write'
         ? wrapCommand(command, root, { allowNetwork: !!ctx.sandboxAllowNetwork })
         : { command, sandboxed: false };
@@ -494,6 +514,104 @@ const tools = {
     },
   },
 
+  git_status: {
+    description:
+      'Show the working tree status plus a summary of what changed (files added/modified/deleted, current branch). Use before committing, or to see what you have already changed this session. Arguments: {}',
+    confirm: false,
+    readOnly: true,
+    run: (_args, root) => {
+      try {
+        const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: root, encoding: 'utf8' }).trim();
+        const status = execSync('git status --porcelain', { cwd: root, encoding: 'utf8' });
+        const stat = execSync('git diff --stat HEAD', { cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024 * 5 });
+        return truncate(`branch: ${branch}\n\n${status || '(working tree clean)'}\n${stat}`);
+      } catch (err) {
+        return `ERROR: ${err.stderr || err.message}`;
+      }
+    },
+  },
+
+  git_diff: {
+    description:
+      'Show the actual diff of uncommitted changes, optionally for one path. Read this before writing a commit message so the message describes what really changed. Arguments: {"path": string (optional), "staged": boolean (optional)}',
+    confirm: false,
+    readOnly: true,
+    run: ({ path: p, staged }, root) => {
+      try {
+        const target = p ? ` -- ${JSON.stringify(safePath(root, p))}` : '';
+        const out = execSync(`git diff ${staged ? '--staged' : ''}${target}`, {
+          cwd: root,
+          encoding: 'utf8',
+          maxBuffer: 1024 * 1024 * 10,
+        });
+        return truncate(out || '(no changes)');
+      } catch (err) {
+        return `ERROR: ${err.stderr || err.message}`;
+      }
+    },
+  },
+
+  git_commit: {
+    description:
+      'Stage the given paths (or all changes) and create a commit. Always run git_diff first and write a message describing the actual change and why. Arguments: {"message": string, "paths": string[] (optional, defaults to all changes)}',
+    confirm: true,
+    kind: 'command',
+    run: ({ message, paths }, root) => {
+      if (!message || !message.trim()) return 'ERROR: a commit message is required';
+      try {
+        if (Array.isArray(paths) && paths.length > 0) {
+          for (const p of paths) execSync(`git add ${JSON.stringify(safePath(root, p))}`, { cwd: root });
+        } else {
+          execSync('git add -A', { cwd: root });
+        }
+        const staged = execSync('git diff --staged --name-only', { cwd: root, encoding: 'utf8' }).trim();
+        if (!staged) return 'ERROR: nothing staged to commit';
+        // -F - keeps multi-line messages intact and avoids any shell quoting
+        // pitfalls with quotes/backticks in the message body.
+        execSync('git commit -F -', { cwd: root, input: message, encoding: 'utf8' });
+        const sha = execSync('git rev-parse --short HEAD', { cwd: root, encoding: 'utf8' }).trim();
+        return `OK: committed ${sha}\n${staged}`;
+      } catch (err) {
+        return `ERROR: ${err.stderr || err.message}`;
+      }
+    },
+  },
+
+  semantic_search: {
+    description:
+      'Search the codebase by MEANING rather than exact text — e.g. "where do we handle auth failures" or "retry logic for network calls". Use this when you do not know the exact identifier to grep for; use search_code when you do. Requires the index (build it with the "Cortex: Build Code Index" command). Arguments: {"query": string, "topK": number (optional, default 8)}',
+    confirm: false,
+    readOnly: true,
+    run: async ({ query, topK }, root, ctx) => {
+      if (!query) return 'ERROR: query is required';
+      let hits;
+      try {
+        hits = await codeIndex.search(root, query, { host: ctx?.host, topK: topK || 8 });
+      } catch (err) {
+        return `ERROR: semantic search failed (${err.message}). Is the embedding model pulled? ("ollama pull nomic-embed-text")`;
+      }
+      if (hits === null) return 'ERROR: no code index yet. Run the "Cortex: Build Code Index" command first, or use search_code instead.';
+      if (hits.length === 0) return '(no semantically similar code found)';
+      return truncate(
+        hits
+          .map((h) => `${h.path}:${h.startLine}-${h.endLine}  (score ${h.score.toFixed(3)})\n${h.text}`)
+          .join('\n\n')
+      );
+    },
+  },
+
+  diagnostics: {
+    description:
+      "Get the editor's current compiler/linter errors and warnings (the same ones shown in the Problems panel) — real type errors, unresolved imports, lint violations. Far faster than running the test suite, and the fastest way to check whether an edit actually holds up. Arguments: {\"path\": string (optional, defaults to the whole workspace)}",
+    confirm: false,
+    readOnly: true,
+    run: ({ path: p }, root) => {
+      const out = lsp.getDiagnostics(root, p);
+      if (out === null) return 'ERROR: diagnostics are only available inside the VS Code extension host, not the CLI.';
+      return truncate(out || '(no problems reported)');
+    },
+  },
+
   update_tasks: {
     description:
       'Record or update your plan for a multi-step task as a Markdown checklist (e.g. "- [x] read config\\n- [ ] add the route"). This list is stored on disk and shown back to you every turn, so it survives context trimming and /compact — use it on any task with more than ~3 steps, and re-send the full updated list each time you finish a step. Arguments: {"markdown": string}',
@@ -511,8 +629,12 @@ const tools = {
       'Find where a function/class/const/variable named `name` is DEFINED (not just mentioned) — greps for common declaration patterns (function/class/const/let/def/interface/type) across the workspace. Faster and more precise than search_code when you know the symbol name. Arguments: {"name": string, "path": string (optional, default ".")}',
     confirm: false,
     readOnly: true,
-    run: ({ name, path: p }, root) => {
+    run: async ({ name, path: p }, root) => {
       if (!name) return 'ERROR: name is required';
+      // Ask the language server first: it knows which symbol is actually
+      // meant, where grep only knows which lines contain the characters.
+      const viaLsp = await lsp.findDefinitions(root, name).catch(() => null);
+      if (viaLsp) return truncate(`(via language server)\n${viaLsp}`);
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const pattern = `(function|class|const|let|var|def|interface|type|struct|fn)\\s+${escaped}\\b|${escaped}\\s*[:=]\\s*(function|\\(|async)`;
       try {
@@ -534,8 +656,10 @@ const tools = {
       'Find every place `name` is USED/referenced across the workspace (all mentions, not just the definition) — use after find_symbol to see callers/usages before changing or removing something. Arguments: {"name": string, "path": string (optional, default ".")}',
     confirm: false,
     readOnly: true,
-    run: ({ name, path: p }, root) => {
+    run: async ({ name, path: p }, root) => {
       if (!name) return 'ERROR: name is required';
+      const viaLsp = await lsp.findReferences(root, name).catch(() => null);
+      if (viaLsp) return truncate(`(via language server)\n${viaLsp}`);
       try {
         const dir = safePath(root, p || '.');
         const out = execSync(

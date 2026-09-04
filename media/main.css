@@ -578,3 +578,32 @@ body {
   color: var(--cortex-accent);
 }
 @keyframes blink { 50% { opacity: 0; } }
+
+.checkpoint-marker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  align-self: center;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  padding: 2px 0;
+}
+.checkpoint-marker::before,
+.checkpoint-marker::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  min-width: 24px;
+  background: var(--vscode-widget-border, var(--vscode-panel-border));
+}
+.checkpoint-marker button {
+  background: none;
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+  color: var(--vscode-descriptionForeground);
+  border-radius: 999px;
+  padding: 1px 8px;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.checkpoint-marker button:hover:not(:disabled) { color: var(--cortex-accent); border-color: var(--cortex-accent); }
+.checkpoint-marker button:disabled { opacity: 0.5; cursor: default; }

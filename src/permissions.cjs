@@ -5,6 +5,8 @@
 
 'use strict';
 
+const { classifyCommand } = require('./dangerousCommands.cjs');
+
 // Legacy names (this project's own first pass, and Codex CLI's pre-0.147
 // suggest/auto-edit/full-auto model, since removed upstream in favor of the
 // two-axis approvalPolicy + sandboxMode split below) still map onto the
@@ -30,6 +32,17 @@ function normalizeApprovalPolicy(p) {
  */
 function shouldAutoApprove(toolName, policy) {
   if (!policy) return false;
+
+  // Safety floor, checked before every other rule including autoApprove and
+  // approvalPolicy 'never'. Tool output (file contents, fetched pages, MCP
+  // results) is attacker-controllable text that reaches the model, so a
+  // destructive command must never be reachable without a human in the
+  // loop — no policy, profile, or allowlist can opt out of this.
+  if (policy.commandArg) {
+    const { dangerous } = classifyCommand(policy.commandArg);
+    if (dangerous) return false;
+  }
+
   if (policy.autoApprove) return true;
 
   // Two independent axes, matching current Codex CLI:

@@ -20,14 +20,21 @@
   let currentAssistantEl = null; // streaming bubble currently being written to
   let currentAssistantBuf = '';
   let busy = false;
-  const sessionStats = { toolCalls: 0, totalMs: 0 };
+  const sessionStats = { toolCalls: 0, totalMs: 0, promptTokens: 0, completionTokens: 0, lastPrompt: 0, contextBudget: 0 };
   function renderSessionStats() {
     if (!sessionStatsEl) return;
     if (!sessionStats.toolCalls && !sessionStats.totalMs) {
       sessionStatsEl.textContent = '';
       return;
     }
-    sessionStatsEl.textContent = `${sessionStats.toolCalls} call${sessionStats.toolCalls === 1 ? '' : 's'} · ${(sessionStats.totalMs / 1000).toFixed(1)}s`;
+    const tok = sessionStats.promptTokens + sessionStats.completionTokens;
+    const parts = [`${sessionStats.toolCalls} call${sessionStats.toolCalls === 1 ? '' : 's'}`, `${(sessionStats.totalMs / 1000).toFixed(1)}s`];
+    if (tok) parts.push(`${tok > 1000 ? (tok / 1000).toFixed(1) + 'k' : tok} tok`);
+    // context utilisation is the number that actually predicts truncation
+    if (sessionStats.lastPrompt && sessionStats.contextBudget) {
+      parts.push(`${Math.round((sessionStats.lastPrompt / sessionStats.contextBudget) * 100)}% ctx`);
+    }
+    sessionStatsEl.textContent = parts.join(' \u00b7 ');
   }
 
   // ---------- tiny, dependency-free markdown renderer ----------
@@ -710,6 +717,35 @@
         break;
       case 'token':
         appendToken(msg.text);
+        break;
+      case 'checkpointCreated': {
+        const div = document.createElement('div');
+        div.className = 'checkpoint-marker';
+        const label = document.createElement('span');
+        label.textContent = `checkpoint \u00b7 ${msg.count} file change${msg.count === 1 ? '' : 's'}`;
+        const btn = document.createElement('button');
+        btn.textContent = 'Rewind here';
+        btn.title = 'Restore files and conversation to just before this turn';
+        btn.onclick = () => {
+          btn.disabled = true;
+          vscode.postMessage({ type: 'rewindTo', checkpointId: msg.id });
+        };
+        div.appendChild(label);
+        div.appendChild(btn);
+        messagesEl.appendChild(div);
+        scrollToBottom();
+        break;
+      }
+      case 'rewound':
+        restoreSession(msg.messages);
+        addSystemNote(`Rewound \u2014 restored ${msg.paths.length} file(s): ${msg.paths.join(', ') || 'none'}`);
+        break;
+      case 'usage':
+        sessionStats.promptTokens += msg.promptTokens || 0;
+        sessionStats.completionTokens += msg.completionTokens || 0;
+        sessionStats.lastPrompt = msg.promptTokens || sessionStats.lastPrompt;
+        sessionStats.contextBudget = msg.contextBudget || sessionStats.contextBudget;
+        renderSessionStats();
         break;
       case 'toolCall':
         addToolCall(msg.name, msg.args, msg.id);

@@ -13,6 +13,7 @@ const { buildContextMessages, DEFAULT_BUDGET_TOKENS } = require('./contextManage
 const { verifySyntax } = require('./verify.cjs');
 const { pickModel } = require('./router.cjs');
 const { getStaleWarning } = require('./fileTracker.cjs');
+const lsp = require('./lsp.cjs');
 
 // Pull a TOOL_CALL: {...} instruction out of a model response.
 //
@@ -96,6 +97,39 @@ function parseToolCall(text) {
   }
 }
 
+// Parses EVERY TOOL_CALL in a response, not just the first.
+//
+// One call per round-trip means reading five files costs five full model
+// round-trips. Letting the model emit several read-only calls at once and
+// running them together collapses that into one, which is the single
+// biggest latency win available here and costs no quality — strong models
+// batch reads naturally when told they can.
+//
+// Mutating calls are deliberately NOT batched: each one needs its own
+// approval, diff and checkpoint, and later edits in a batch could be built
+// on assumptions invalidated by earlier ones.
+function parseToolCalls(text) {
+  const calls = [];
+  let rest = text;
+  let offset = 0;
+  while (true) {
+    const parsed = parseToolCall(rest);
+    if (!parsed.attempted) break;
+    calls.push(parsed);
+    if (!parsed.ok) break; // stop at the first malformed one so the model gets a clear error
+    // advance past this call's closing brace to look for the next one
+    const idx = rest.indexOf('TOOL_CALL:');
+    const nextSearchFrom = idx + 'TOOL_CALL:'.length;
+    const following = rest.slice(nextSearchFrom);
+    const nextIdx = following.indexOf('TOOL_CALL:');
+    if (nextIdx === -1) break;
+    rest = following.slice(nextIdx);
+    offset += nextSearchFrom + nextIdx;
+    if (calls.length >= 8) break; // sanity cap
+  }
+  return calls;
+}
+
 /**
  * @param {object} opts
  * @param {Array} opts.history           mutable array of {role, content} messages (mutated in place)
@@ -142,6 +176,7 @@ async function runTurn(opts) {
     ctx,
     signal,
     onToken,
+    onUsage,
     onToolCall,
     requestApproval,
     onToolResult,
@@ -174,7 +209,7 @@ async function runTurn(opts) {
 
     let reply;
     try {
-      reply = await chat({ host, provider, apiKey, model: activeModel, messages, temperature, signal, onToken, logFn: onLog });
+      reply = await chat({ host, provider, apiKey, model: activeModel, messages, temperature, signal, onToken, onUsage, logFn: onLog });
     } catch (err) {
       if (err.name === 'AbortError') return;
       onLog?.(`step ${steps}: error — ${err.message}`);
@@ -232,6 +267,37 @@ async function runTurn(opts) {
       history.push({ role: 'user', content: `TOOL_RESULT: ${msg}` });
       onToolResult(msg, true, null);
       consecutiveFailures++;
+      continue;
+    }
+
+    // Batch path: several read-only calls in one response run concurrently
+    // and come back as a single combined result, turning N round-trips into
+    // one. Anything mutating falls through to the single-call path below so
+    // it keeps its own approval, diff and checkpoint.
+    const allCalls = parseToolCalls(reply);
+    if (allCalls.length > 1 && allCalls.every((c) => c.ok && tools[c.data.name] && tools[c.data.name].readOnly)) {
+      const batch = allCalls.map((c) => ({ name: c.data.name, args: c.data.arguments || {}, callId: crypto.randomUUID() }));
+      onLog?.(`step ${steps}: running ${batch.length} read-only tool calls in parallel`);
+      for (const b of batch) onToolCall(b.name, b.args, b.callId);
+
+      const settled = await Promise.all(
+        batch.map(async (b) => {
+          try {
+            const out = await tools[b.name].run(b.args, root, ctx);
+            return { ...b, result: out, isError: typeof out === 'string' && out.startsWith('ERROR') };
+          } catch (err) {
+            return { ...b, result: `ERROR running tool: ${err.message}`, isError: true };
+          }
+        })
+      );
+
+      for (const r of settled) onToolResult(r.result, r.isError, r.callId);
+      consecutiveFailures = settled.every((r) => r.isError) ? consecutiveFailures + 1 : 0;
+      const combined = settled
+        .map((r) => `--- ${r.name}(${JSON.stringify(r.args)}) ---\n${r.result}`)
+        .join('\n\n');
+      const stale = getStaleWarning(root);
+      history.push({ role: 'user', content: `TOOL_RESULT:\n${combined}${stale ? `\n\n${stale}` : ''}` });
       continue;
     }
 
@@ -315,6 +381,18 @@ async function runTurn(opts) {
     if (!isError && verification && verification.ok === false) {
       result += `\n\nSYNTAX WARNING: the file you just wrote does not parse. Details: ${verification.message}\nFix this before moving on — either re-read the file and correct it, or explain the issue to the user.`;
     }
+    // Real compiler/linter errors from the language server, for the file
+    // just edited. verifySyntax only proves the file parses; this catches
+    // the errors that actually matter (unresolved imports, type mismatches,
+    // lint violations) in milliseconds, without waiting for a test run.
+    if (!isError && tool.kind === 'edit' && args.path && lsp.available()) {
+      const problems = await lsp.getDiagnosticsAfterEdit(root, args.path).catch(() => null);
+      if (problems) {
+        result += `\n\nPROBLEMS reported by the language server after this edit:\n${problems}\nFix these before moving on.`;
+        isError = true; // count it as a failure so escalation/fallback logic sees a stuck edit
+      }
+    }
+
     consecutiveFailures = isError || (verification && verification.ok === false) ? consecutiveFailures + 1 : 0;
 
     // If the user edited a file in their editor while the agent was mid-turn,
@@ -348,4 +426,4 @@ async function runTurn(opts) {
   onError('Stopped: too many steps without a final answer. Try starting a new chat or narrowing your request.');
 }
 
-module.exports = { runTurn, parseToolCall };
+module.exports = { runTurn, parseToolCall, parseToolCalls };

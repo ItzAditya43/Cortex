@@ -118,6 +118,7 @@ class ChatViewProvider {
       sandboxMode: c.get('sandboxMode') || (c.get('sandboxCommands') ? 'workspace-write' : 'danger-full-access'),
       sandboxAllowNetwork: !!c.get('sandboxAllowNetwork'),
       approveForMe: !!c.get('approveForMe'),
+      useTerminal: c.get('useTerminal') !== false,
     };
     return applyProfile(base, c.get('profiles') || {}, this.activeProfile || c.get('activeProfile') || '');
   }
@@ -300,6 +301,9 @@ class ChatViewProvider {
         break;
       case 'revert':
         await this.revertChange(msg.id);
+        break;
+      case 'rewindTo':
+        await this.rewindTo(msg.checkpointId);
         break;
       case 'revertTurn':
         await this.revertLastTurn();
@@ -623,6 +627,10 @@ class ChatViewProvider {
     const startedAt = Date.now();
     const turnCallIds = [];
     const turnId = nonce().slice(0, 8); // groups this turn's snapshots so a whole turn can be reverted after a reload
+    // Remember where this turn begins so a later rewind can cut the
+    // conversation back to exactly this point.
+    this.turnStartIndexes = this.turnStartIndexes || {};
+    this.turnStartIndexes[turnId] = this.history.length - 1;
 
     try {
       await runTurn({
@@ -649,6 +657,7 @@ class ChatViewProvider {
           webhookUrl: cfg.webhookUrl,
           sandboxMode: cfg.sandboxMode,
           sandboxAllowNetwork: cfg.sandboxAllowNetwork,
+          useTerminal: cfg.useTerminal,
           delegateConfig: {
             host: cfg.host,
             provider: cfg.provider,
@@ -665,6 +674,9 @@ class ChatViewProvider {
         onToken: (t) => {
           this.post({ type: 'token', text: t });
         },
+        onUsage: (u) => {
+          this.post({ type: 'usage', ...u, contextBudget: cfg.contextBudgetTokens });
+        },
         onToolCall: (name, args, callId) => {
           this.post({ type: 'toolCall', name, args, id: callId });
         },
@@ -674,7 +686,7 @@ class ChatViewProvider {
               autoApprove: cfg.autoApprove,
               autoApproveTools: this.autoApproveTools,
               autoApproveCommands: cfg.autoApproveCommands,
-              commandArg: name === 'run_command' ? args.command : undefined,
+              commandArg: tools[name]?.kind === 'command' ? args.command : undefined,
               approvalPolicy: cfg.approvalPolicy,
               sandboxMode: cfg.sandboxMode,
               toolKind: tools[name]?.kind,
@@ -726,7 +738,7 @@ class ChatViewProvider {
       if (turnCallIds.length > 0) {
         this.checkpoints = this.checkpoints || [];
         this.checkpoints.push({ id: turnId, callIds: turnCallIds, at: Date.now() });
-        this.post({ type: 'checkpointCreated', callIds: turnCallIds, count: turnCallIds.length });
+        this.post({ type: 'checkpointCreated', id: turnId, callIds: turnCallIds, count: turnCallIds.length });
       }
       saveHistory(root, this.sessionId, this.history);
       touchSession(root, this.sessionId, this.history);
@@ -734,6 +746,53 @@ class ChatViewProvider {
       this.abortController = null;
       this.post({ type: 'busy', value: false });
     }
+  }
+
+  // Rewinds the session to an earlier checkpoint: restores the files that
+  // turn (and everything after it) changed, and truncates the conversation
+  // back to that point. This is the "edit a message from 10 steps back and
+  // continue from there" flow — without it, checkpoints only ever let you
+  // undo the very last thing.
+  async rewindTo(checkpointId) {
+    const root = this.root;
+    if (!root || !this.checkpoints) return;
+    const idx = this.checkpoints.findIndex((c) => c.id === checkpointId);
+    if (idx === -1) return;
+
+    // Walk newest -> oldest so the OLDEST snapshot of each path wins, which
+    // is the state as it was before the whole rewound range.
+    const doomed = this.checkpoints.slice(idx);
+    const restored = new Set();
+    for (let c = doomed.length - 1; c >= 0; c--) {
+      const cp = doomed[c];
+      for (let i = cp.callIds.length - 1; i >= 0; i--) {
+        const callId = cp.callIds[i];
+        const snap = this.revertable.get(callId);
+        if (!snap) continue;
+        try {
+          tools.write_file.run({ path: snap.path, content: snap.before }, root);
+          restored.add(snap.path);
+          this.revertable.delete(callId);
+          deleteSnapshot(root, this.sessionId, callId);
+        } catch (err) {
+          this.post({ type: 'error', text: `Rewind failed for ${snap.path}: ${err.message}` });
+        }
+      }
+    }
+    this.checkpoints = this.checkpoints.slice(0, idx);
+
+    // Drop the conversation from the rewound turn onward, so the model isn't
+    // told about work whose files no longer exist.
+    const cutoff = this.turnStartIndexes?.[checkpointId];
+    if (typeof cutoff === 'number') this.history = this.history.slice(0, cutoff);
+    saveHistory(root, this.sessionId, this.history);
+
+    this.post({
+      type: 'rewound',
+      checkpointId,
+      paths: [...restored],
+      messages: simplifyHistoryForDisplay(this.history),
+    });
   }
 
   // Reverts every file change made during the most recent turn (not just one
