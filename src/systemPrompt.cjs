@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { toolListForPrompt } = require('./tools.cjs');
+const { loadTasks } = require('./taskList.cjs');
 
 // Project-local conventions files: .cortexrules (Cline's .clinerules
 // convention) and AGENTS.md (the Codex CLI / cross-tool convention —
@@ -52,6 +53,7 @@ function loadProjectRules(cwd, openFile) {
 // itself is universal.
 function buildSystemPrompt({ memoryNotes, cwd, openFile, planMode, selection }) {
   const projectRules = loadProjectRules(cwd, openFile);
+  const tasks = loadTasks(cwd);
   return `You are Cortex, an autonomous coding assistant embedded in VS Code, similar in spirit to Cline/Claude Code, but running entirely on local models via Ollama. You read, write, edit, and run code directly inside the user's open workspace at:
 ${cwd}
 ${openFile ? `\nThe user currently has this file open in the editor: ${openFile}\n` : ''}
@@ -89,7 +91,8 @@ Guidelines:
 - If a request is ambiguous, make the most reasonable assumption and proceed rather than stalling — only ask the user a question (as a final plain-text answer, no tool call) if you genuinely cannot proceed without more information.
 - Be thorough while working, but concise in your final summary to the user.
 ${memoryNotes ? `\nLong-term memory notes from previous sessions in this workspace:\n${memoryNotes}` : ''}
-${projectRules ? `\nProject rules (follow these strictly; if multiple sections conflict, the later/more specific one wins):\n${projectRules}` : ''}`;
+${projectRules ? `\nProject rules (follow these strictly; if multiple sections conflict, the later/more specific one wins):\n${projectRules}` : ''}
+${tasks ? `\nCURRENT TASK LIST (persists across context trimming — keep it updated with update_tasks as you finish steps):\n${tasks}` : ''}`;
 }
 
 module.exports = { buildSystemPrompt, loadProjectRules };

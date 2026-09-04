@@ -12,6 +12,7 @@ const { buildSystemPrompt } = require('./systemPrompt.cjs');
 const { buildContextMessages, DEFAULT_BUDGET_TOKENS } = require('./contextManager.cjs');
 const { verifySyntax } = require('./verify.cjs');
 const { pickModel } = require('./router.cjs');
+const { getStaleWarning } = require('./fileTracker.cjs');
 
 // Pull a TOOL_CALL: {...} instruction out of a model response.
 //
@@ -154,6 +155,7 @@ async function runTurn(opts) {
   let codeFenceNudged = false;
   let testRan = false;
   let consecutiveFailures = 0;
+  const editFailuresByPath = new Map(); // path -> consecutive edit_file misses, drives the whole-file fallback
 
   while (steps < maxSteps) {
     if (signal?.aborted) return;
@@ -314,6 +316,29 @@ async function runTurn(opts) {
       result += `\n\nSYNTAX WARNING: the file you just wrote does not parse. Details: ${verification.message}\nFix this before moving on — either re-read the file and correct it, or explain the issue to the user.`;
     }
     consecutiveFailures = isError || (verification && verification.ok === false) ? consecutiveFailures + 1 : 0;
+
+    // If the user edited a file in their editor while the agent was mid-turn,
+    // the agent's cached view of it is stale — say so now, before it builds
+    // another edit on content that no longer exists.
+    const staleWarning = getStaleWarning(root);
+    if (staleWarning) result += `\n\n${staleWarning}`;
+
+    // Adaptive edit strategy: snippet-based edits that keep missing on the
+    // same file are the classic infinite-retry trap. After two misses, stop
+    // suggesting a better snippet and switch the model to a whole-file
+    // rewrite, which has no matching step to fail.
+    if (isError && tool.kind === 'edit' && args.path) {
+      const misses = (editFailuresByPath.get(args.path) || 0) + 1;
+      editFailuresByPath.set(args.path, misses);
+      if (misses >= 2) {
+        result +=
+          `\n\nSTRATEGY CHANGE: edit_file has now failed ${misses} times on ${args.path}. Stop retrying snippet edits ` +
+          `on this file. Call read_file to get its current contents, then use write_file with the COMPLETE updated ` +
+          `file — that has no snippet to mismatch.`;
+      }
+    } else if (!isError && tool.kind === 'edit' && args.path) {
+      editFailuresByPath.delete(args.path);
+    }
 
     history.push({ role: 'user', content: `TOOL_RESULT:\n${result}` });
     onLog?.(`step ${steps}: tool result [${callId}] ${isError ? 'ERROR' : 'ok'} (${String(result).length} chars)`);

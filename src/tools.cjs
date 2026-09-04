@@ -14,6 +14,8 @@ const { execSync, spawn } = require('child_process');
 const { appendMemoryNote } = require('./memory.cjs');
 const { indexNote } = require('./semanticMemory.cjs');
 const { wrapCommand } = require('./sandbox.cjs');
+const { markAgentRead, markAgentWrite } = require('./fileTracker.cjs');
+const { saveTasks, taskProgress } = require('./taskList.cjs');
 
 const MAX_RESULT_CHARS = 8000;
 
@@ -41,6 +43,71 @@ function safePath(root, p) {
   return full;
 }
 
+// Locates `oldStr` inside `content`, tolerating the near-miss mismatches
+// every model makes regardless of size: trailing whitespace, tabs-vs-spaces,
+// and CRLF-vs-LF. An exact hit always wins; fuzzy passes only run when the
+// exact one fails, and only accept a UNIQUE match, so relaxing the match
+// can never silently rewrite the wrong region.
+//
+// Returns {ok, start, end, how} on success, or {ok:false, reason, count}.
+function locateSnippet(content, oldStr) {
+  const exactCount = content.split(oldStr).length - 1;
+  if (exactCount === 1) {
+    const start = content.indexOf(oldStr);
+    return { ok: true, start, end: start + oldStr.length, how: 'exact' };
+  }
+  if (exactCount > 1) return { ok: false, reason: 'ambiguous', count: exactCount };
+
+  // Fuzzy passes, ordered most-conservative first. Each builds a regex from
+  // the snippet where a specific class of insignificant difference is
+  // allowed to vary, then requires exactly one match.
+  const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const attempts = [
+    // line-ending and trailing-whitespace insensitive
+    {
+      how: 'whitespace-insensitive',
+      pattern: oldStr
+        .split(/\r?\n/)
+        .map((line) => escape(line.replace(/[ \t]+$/, '')) + '[ \\t]*')
+        .join('\\r?\\n'),
+    },
+    // additionally indentation-insensitive (tabs vs spaces, depth changes)
+    {
+      how: 'indentation-insensitive',
+      pattern: oldStr
+        .split(/\r?\n/)
+        .map((line) => '[ \\t]*' + escape(line.trim()) + '[ \\t]*')
+        .join('\\r?\\n'),
+    },
+  ];
+
+  for (const { how, pattern } of attempts) {
+    let re;
+    try {
+      re = new RegExp(pattern, 'g');
+    } catch {
+      continue; // pathological snippet produced an invalid pattern — skip this pass
+    }
+    const matches = [...content.matchAll(re)];
+    if (matches.length === 1) {
+      return { ok: true, start: matches[0].index, end: matches[0].index + matches[0][0].length, how };
+    }
+    if (matches.length > 1) return { ok: false, reason: 'ambiguous', count: matches.length };
+  }
+  return { ok: false, reason: 'not-found', count: 0 };
+}
+
+// Applies an edit via locateSnippet, preserving the file's own indentation
+// when the match was only found indentation-insensitively.
+function applySnippet(content, oldStr, newStr) {
+  const hit = locateSnippet(content, oldStr);
+  if (!hit.ok) return hit;
+  return { ok: true, how: hit.how, after: content.slice(0, hit.start) + (newStr ?? '') + content.slice(hit.end) };
+}
+
+const NOT_FOUND_HINT =
+  'Re-read the file with read_file and copy the snippet verbatim. If it still fails, use write_file with the complete new file contents instead of retrying edit_file.';
+
 const tools = {
   read_file: {
     description: 'Read a file\'s contents (with line numbers). Arguments: {"path": string}',
@@ -51,6 +118,7 @@ const tools = {
       if (!fs.existsSync(full)) return `ERROR: file not found: ${p}`;
       if (fs.statSync(full).isDirectory()) return `ERROR: ${p} is a directory, use list_dir`;
       const content = fs.readFileSync(full, 'utf8');
+      markAgentRead(root, p);
       const numbered = content.split('\n').map((l, i) => `${i + 1}\t${l}`).join('\n');
       return truncate(numbered);
     },
@@ -69,6 +137,7 @@ const tools = {
       const full = safePath(root, p);
       fs.mkdirSync(path.dirname(full), { recursive: true });
       fs.writeFileSync(full, content ?? '');
+      markAgentWrite(root, p);
       return `OK: wrote ${(content ?? '').length} chars to ${p}`;
     },
   },
@@ -83,22 +152,33 @@ const tools = {
       if (!fs.existsSync(full)) return { path: p, error: `file not found: ${p}` };
       const before = fs.readFileSync(full, 'utf8');
       if (!old_str) return { path: p, error: 'old_str must not be empty' };
-      const count = before.split(old_str).length - 1;
-      if (count === 0) return { path: p, error: `old_str not found in ${p}` };
-      if (count > 1) return { path: p, error: `old_str matches ${count} places in ${p}, needs more context` };
-      const after = before.replace(old_str, new_str ?? '');
-      return { path: p, before, after };
+      const applied = applySnippet(before, old_str, new_str);
+      if (!applied.ok) {
+        return {
+          path: p,
+          error:
+            applied.reason === 'ambiguous'
+              ? `old_str matches ${applied.count} places in ${p}, needs more context`
+              : `old_str not found in ${p}`,
+        };
+      }
+      return { path: p, before, after: applied.after };
     },
     run: ({ path: p, old_str, new_str }, root) => {
       const full = safePath(root, p);
       if (!fs.existsSync(full)) return `ERROR: file not found: ${p}`;
       const content = fs.readFileSync(full, 'utf8');
       if (!old_str) return 'ERROR: old_str must not be empty';
-      const count = content.split(old_str).length - 1;
-      if (count === 0) return `ERROR: old_str not found in ${p}. Re-read the file and match exactly.`;
-      if (count > 1) return `ERROR: old_str matches ${count} places in ${p}. Add more surrounding context to make it unique.`;
-      fs.writeFileSync(full, content.replace(old_str, new_str ?? ''));
-      return `OK: edited ${p}`;
+      const applied = applySnippet(content, old_str, new_str);
+      if (!applied.ok) {
+        if (applied.reason === 'ambiguous') {
+          return `ERROR: old_str matches ${applied.count} places in ${p}. Add more surrounding context to make it unique.`;
+        }
+        return `ERROR: old_str not found in ${p}. ${NOT_FOUND_HINT}`;
+      }
+      fs.writeFileSync(full, applied.after);
+      markAgentWrite(root, p);
+      return `OK: edited ${p}${applied.how === 'exact' ? '' : ` (matched ${applied.how} — your snippet's whitespace differed from the file)`}`;
     },
   },
 
@@ -398,13 +478,31 @@ const tools = {
         if (!fs.existsSync(full)) return `ERROR: file not found: ${e.path} (no files were changed)`;
         const before = fs.readFileSync(full, 'utf8');
         if (!e.old_str) return `ERROR: old_str empty for ${e.path} (no files were changed)`;
-        const count = before.split(e.old_str).length - 1;
-        if (count === 0) return `ERROR: old_str not found in ${e.path} (no files were changed)`;
-        if (count > 1) return `ERROR: old_str matches ${count} places in ${e.path}, needs more context (no files were changed)`;
-        planned.push({ full, path: e.path, after: before.replace(e.old_str, e.new_str ?? '') });
+        const applied = applySnippet(before, e.old_str, e.new_str);
+        if (!applied.ok) {
+          return applied.reason === 'ambiguous'
+            ? `ERROR: old_str matches ${applied.count} places in ${e.path}, needs more context (no files were changed)`
+            : `ERROR: old_str not found in ${e.path} (no files were changed). ${NOT_FOUND_HINT}`;
+        }
+        planned.push({ full, path: e.path, after: applied.after });
       }
-      for (const p of planned) fs.writeFileSync(p.full, p.after);
+      for (const p of planned) {
+        fs.writeFileSync(p.full, p.after);
+        markAgentWrite(root, p.path);
+      }
       return `OK: applied ${planned.length} edit(s) across ${new Set(planned.map((p) => p.path)).size} file(s): ${planned.map((p) => p.path).join(', ')}`;
+    },
+  },
+
+  update_tasks: {
+    description:
+      'Record or update your plan for a multi-step task as a Markdown checklist (e.g. "- [x] read config\\n- [ ] add the route"). This list is stored on disk and shown back to you every turn, so it survives context trimming and /compact — use it on any task with more than ~3 steps, and re-send the full updated list each time you finish a step. Arguments: {"markdown": string}',
+    confirm: false,
+    run: ({ markdown }, root) => {
+      if (typeof markdown !== 'string' || !markdown.trim()) return 'ERROR: markdown checklist is required';
+      saveTasks(root, markdown);
+      const { done, total } = taskProgress(root);
+      return `OK: task list updated (${done}/${total} done)`;
     },
   },
 

@@ -20,6 +20,9 @@ const { retrieveRelevantNotes } = require('./semanticMemory.cjs');
 const { reviewAction } = require('./approveForMe.cjs');
 const { applyProfile } = require('./profiles.cjs');
 const { generateProjectRules } = require('./initRules.cjs');
+const { saveSnapshot, loadSnapshots, deleteSnapshot, clearSession, pruneOldSessions } = require('./checkpoints.cjs');
+const { clearTasks } = require('./taskList.cjs');
+const { markAgentWrite, getStaleWarning } = require('./fileTracker.cjs');
 const logger = require('./logger.cjs');
 
 const MUTATING_TOOLS = Object.entries(tools)
@@ -341,12 +344,36 @@ class ChatViewProvider {
     this.abortController?.abort();
     this.sessionId = id;
     this.history = loadHistory(root, id);
+    this.restoreCheckpoints();
     this.post({ type: 'restoreSession', id, messages: simplifyHistoryForDisplay(this.history) });
+  }
+
+  // Rehydrates undo history from disk so "revert this edit" still works
+  // after a window reload or on a resumed session, not just within the
+  // lifetime of one extension host process.
+  restoreCheckpoints() {
+    const root = this.root;
+    if (!root) return;
+    this.revertable.clear();
+    this.checkpoints = [];
+    const byTurn = new Map();
+    for (const snap of loadSnapshots(root, this.sessionId)) {
+      this.revertable.set(snap.callId, { path: snap.path, before: snap.before });
+      const turnId = snap.turnId || snap.callId;
+      if (!byTurn.has(turnId)) byTurn.set(turnId, { id: turnId, callIds: [], at: snap.at });
+      byTurn.get(turnId).callIds.push(snap.callId);
+    }
+    this.checkpoints = [...byTurn.values()].sort((a, b) => a.at - b.at);
   }
 
   newChat() {
     const root = this.root;
-    if (root) resetHistory(root, this.sessionId);
+    if (root) {
+      resetHistory(root, this.sessionId);
+      clearSession(root, this.sessionId);
+      clearTasks(root); // a new chat is a new task — don't inherit the old checklist
+      pruneOldSessions(root);
+    }
     this.sessionId = nonce().slice(0, 8);
     this.history = [];
     this.revertable.clear();
@@ -413,6 +440,7 @@ class ChatViewProvider {
     try {
       tools.write_file.run({ path: snapshot.path, content: snapshot.before }, root);
       this.revertable.delete(callId);
+      deleteSnapshot(root, this.sessionId, callId);
       this.history.push({
         role: 'user',
         content: `TOOL_RESULT: SYSTEM NOTE — the user manually reverted your change to ${snapshot.path} back to its previous contents. Take this into account if you continue working.`,
@@ -594,6 +622,7 @@ class ChatViewProvider {
     const planMode = this.mode === 'plan';
     const startedAt = Date.now();
     const turnCallIds = [];
+    const turnId = nonce().slice(0, 8); // groups this turn's snapshots so a whole turn can be reverted after a reload
 
     try {
       await runTurn({
@@ -668,6 +697,7 @@ class ChatViewProvider {
           if (snapshot && callId) {
             this.revertable.set(callId, snapshot);
             turnCallIds.push(callId);
+            saveSnapshot(root, this.sessionId, callId, snapshot, turnId);
           }
           const alreadyShown = callId && this.diffShownFor.has(callId);
           this.post({
@@ -695,7 +725,7 @@ class ChatViewProvider {
     } finally {
       if (turnCallIds.length > 0) {
         this.checkpoints = this.checkpoints || [];
-        this.checkpoints.push({ id: nonce().slice(0, 8), callIds: turnCallIds, at: Date.now() });
+        this.checkpoints.push({ id: turnId, callIds: turnCallIds, at: Date.now() });
         this.post({ type: 'checkpointCreated', callIds: turnCallIds, count: turnCallIds.length });
       }
       saveHistory(root, this.sessionId, this.history);
@@ -722,6 +752,7 @@ class ChatViewProvider {
       try {
         tools.write_file.run({ path: snapshot.path, content: snapshot.before }, root);
         this.revertable.delete(callId);
+        deleteSnapshot(root, this.sessionId, callId);
       } catch (err) {
         this.post({ type: 'error', text: `Revert failed for ${snapshot.path}: ${err.message}` });
       }

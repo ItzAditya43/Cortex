@@ -29,10 +29,20 @@ function estimateTokens(text) {
 function buildContextMessages(systemPrompt, history, budgetTokens = DEFAULT_BUDGET_TOKENS) {
   const systemTokens = estimateTokens(systemPrompt);
   let remaining = Math.max(0, budgetTokens - systemTokens);
+
+  // The first real user message is the task itself. Dropping it — which a
+  // plain newest-first trim does as soon as a long tool-heavy run fills the
+  // budget — leaves the model executing tool results with no idea what it
+  // was asked to do. Reserve room for it up front and always send it, so
+  // truncation eats the middle (replaceable tool noise) instead of the goal.
+  const anchorIndex = history.findIndex((m) => m.role === 'user' && !String(m.content || '').startsWith('TOOL_RESULT'));
+  const anchor = anchorIndex === -1 ? null : history[anchorIndex];
+  if (anchor) remaining -= estimateTokens(anchor.content);
+
   const kept = [];
   let droppedCount = 0;
 
-  for (let i = history.length - 1; i >= 0; i--) {
+  for (let i = history.length - 1; i > anchorIndex; i--) {
     const msg = history[i];
     const cost = estimateTokens(msg.content);
     // Always keep at least the most recent message, even if it alone
@@ -41,18 +51,20 @@ function buildContextMessages(systemPrompt, history, budgetTokens = DEFAULT_BUDG
       kept.unshift(msg);
       remaining -= cost;
     } else {
-      droppedCount = i + 1;
+      droppedCount = i - anchorIndex;
       break;
     }
   }
 
   const messages = [{ role: 'system', content: systemPrompt }];
+  if (anchor) messages.push(anchor);
   if (droppedCount > 0) {
     messages.push({
       role: 'user',
       content:
-        `SYSTEM NOTE: ${droppedCount} earlier message(s) in this chat were omitted to fit the model's context ` +
-        `window. Proceed using only what's visible below; if you need something from earlier, ask the user.`,
+        `SYSTEM NOTE: ${droppedCount} intermediate message(s) were omitted to fit the model's context window. ` +
+        `The original request above is still authoritative — keep working toward it. If you need a detail from ` +
+        `the omitted steps, re-read the relevant file rather than guessing.`,
     });
   }
   messages.push(...kept);

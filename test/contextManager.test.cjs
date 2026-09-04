@@ -24,9 +24,22 @@ test('buildContextMessages drops oldest messages and inserts a notice when over 
   // budget only fits system + ~1 of the big messages
   const messages = buildContextMessages('sys', history, 1100);
   assert.strictEqual(messages[0].role, 'system');
-  assert.match(messages[1].content, /SYSTEM NOTE.*omitted/);
+  // the first user message is the task itself and is anchored, never dropped —
+  // truncation eats the replaceable middle instead of the goal
+  assert.strictEqual(messages[1].content, history[0].content);
+  assert.match(messages[2].content, /SYSTEM NOTE.*omitted/);
   // the most recent message must always survive
   assert.strictEqual(messages[messages.length - 1].content, history[2].content);
+});
+
+test('buildContextMessages anchors the original task even when tool noise fills the budget', () => {
+  const history = [{ role: 'user', content: 'ORIGINAL TASK: add JWT auth' }];
+  for (let i = 0; i < 40; i++) history.push({ role: 'user', content: `TOOL_RESULT: ${'x'.repeat(400)}` });
+  const messages = buildContextMessages('sys', history, 2000);
+  assert.ok(
+    messages.some((m) => m.content.includes('ORIGINAL TASK')),
+    'the original request must survive truncation — otherwise the agent forgets what it was asked to do'
+  );
 });
 
 test('buildContextMessages always keeps at least the most recent message even if it alone exceeds budget', () => {
