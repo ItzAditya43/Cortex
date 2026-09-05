@@ -132,6 +132,25 @@ async function runTask(task, model, opts) {
   return result;
 }
 
+// A stalled/unreachable model is not the agent being wrong, and conflating
+// the two makes the benchmark actively harmful: a slow Ollama looks exactly
+// like a quality regression and would push you to revert good changes.
+// These are reported separately and retried before being counted.
+const INFRA_PATTERNS = [
+  /timed out/i,
+  /stopped responding/i,
+  /could not reach/i,
+  /ECONNREFUSED/i,
+  /socket hang up/i,
+  /API error 5\d\d/i,
+  /API error 402/i,
+  /requires a subscription/i,
+];
+function isInfraFailure(result) {
+  const hay = `${result.error || ''}`;
+  return INFRA_PATTERNS.some((re) => re.test(hay));
+}
+
 function selectTasks(opts) {
   let list = tasks;
   if (opts.only) list = list.filter((t) => t.name === opts.only);
@@ -155,23 +174,43 @@ async function main() {
     if (!opts.json) console.log(`\n=== ${model} — ${selected.length} task(s) ===`);
     const results = [];
     for (const task of selected) {
-      const r = await runTask(task, model, opts);
+      let r = await runTask(task, model, opts);
+      // One retry for infrastructure stalls before believing the result.
+      if (!r.passed && isInfraFailure(r)) {
+        if (!opts.json) console.log(`  \x1b[33mRETRY\x1b[0m ${task.name} (model stalled, not an agent failure)`);
+        r = await runTask(task, model, opts);
+      }
+      r.infra = !r.passed && isInfraFailure(r);
       results.push(r);
       if (!opts.json) {
-        const mark = r.passed ? '\x1b[32mPASS\x1b[0m' : '\x1b[31mFAIL\x1b[0m';
+        const mark = r.passed ? '\x1b[32mPASS\x1b[0m' : r.infra ? '\x1b[33mINFRA\x1b[0m' : '\x1b[31mFAIL\x1b[0m';
         console.log(`  ${mark}  ${r.task.padEnd(28)} ${String(r.steps).padStart(2)} steps  ${(r.ms / 1000).toFixed(1)}s`);
         if (!r.passed) console.log(`        ↳ ${r.reason}${r.error ? ` (loop error: ${r.error})` : ''}`);
         if (opts.verbose) console.log(`        tools: ${r.tools.join(' → ') || '(none)'}`);
       }
     }
     const passed = results.filter((r) => r.passed).length;
-    report.models[model] = { passed, total: results.length, rate: passed / results.length, results };
+    const infra = results.filter((r) => r.infra).length;
+    const scored = results.length - infra; // infra failures say nothing about agent quality
+    report.models[model] = {
+      passed,
+      total: results.length,
+      infra,
+      scored,
+      rate: scored > 0 ? passed / scored : 0,
+      results,
+    };
     if (!opts.json) {
-      console.log(`  ---- ${passed}/${results.length} (${Math.round((passed / results.length) * 100)}%)`);
+      console.log(
+        `  ---- ${passed}/${scored} (${scored > 0 ? Math.round((passed / scored) * 100) : 0}%)` +
+          (infra ? `  \x1b[33m[${infra} excluded: model/server stalled, not agent quality]\x1b[0m` : '')
+      );
       const prev = baseline?.models?.[model];
       if (prev) {
         const delta = passed - prev.passed;
-        const regressed = results.filter((r) => !r.passed && prev.results.find((p) => p.task === r.task)?.passed);
+        const regressed = results.filter(
+          (r) => !r.passed && !r.infra && prev.results.find((p) => p.task === r.task)?.passed
+        );
         console.log(
           `  vs baseline: ${delta >= 0 ? '+' : ''}${delta}` +
             (regressed.length ? `  \x1b[31mREGRESSED: ${regressed.map((r) => r.task).join(', ')}\x1b[0m` : '')
