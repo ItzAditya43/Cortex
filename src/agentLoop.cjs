@@ -191,6 +191,7 @@ async function runTurn(opts) {
   let testRan = false;
   let consecutiveFailures = 0;
   const editFailuresByPath = new Map(); // path -> consecutive edit_file misses, drives the whole-file fallback
+  const callSignatures = new Map(); // "tool(args)" -> times seen, for loop detection
 
   while (steps < maxSteps) {
     if (signal?.aborted) return;
@@ -314,6 +315,27 @@ async function runTurn(opts) {
     if (tool.confirm) usedMutatingTool = true; // route to the main model from here on, even if this call gets declined
 
     const args = toolCall.arguments || {};
+
+    // Loop breaker. Models get stuck repeating one identical call — the
+    // benchmark caught a run making the same search_code call 14 times,
+    // burning the entire step budget without ever acting on the answer.
+    // Re-running a read-only tool with identical arguments cannot produce
+    // new information, so say so plainly instead of replaying it.
+    const signature = `${toolCall.name}(${JSON.stringify(args)})`;
+    const seen = (callSignatures.get(signature) || 0) + 1;
+    callSignatures.set(signature, seen);
+    if (seen >= 3) {
+      const msg =
+        `ERROR: you have now called ${signature} ${seen} times with identical arguments and gotten the same ` +
+        `result each time — repeating it cannot tell you anything new. Either act on the result you already ` +
+        `have, try a DIFFERENT tool or different arguments, or give your final answer explaining what you found.`;
+      history.push({ role: 'user', content: `TOOL_RESULT: ${msg}` });
+      onLog?.(`step ${steps}: loop detected — ${signature} repeated ${seen}x`);
+      onToolResult(msg, true, null);
+      consecutiveFailures++;
+      continue;
+    }
+
     const callId = crypto.randomUUID();
     onLog?.(`step ${steps}: tool call ${toolCall.name}(${JSON.stringify(args)}) [${callId}]`);
     onToolCall(toolCall.name, args, callId);

@@ -1,11 +1,43 @@
 # Cortex
 
-A **local, private coding agent for VS Code** — like Cline, but powered entirely
-by models running in [Ollama](https://ollama.com) on your own machine. No API
-keys, no accounts, no cloud calls, no per-token bills. Everything (chat,
-tool-calling, and your code) stays on your machine.
+**The coding agent that uses your language server.**
+
+Cortex is a VS Code agent that reads, writes, and runs your code — and unlike
+CLI agents, it can ask the editor what your code actually *means*. Real
+go-to-definition and find-references instead of grep guesses. Real compiler
+and linter errors fed back after every edit, in milliseconds, instead of
+waiting on a test run. That's the difference between an agent that thinks it
+fixed something and one that knows.
+
+It runs on [Ollama](https://ollama.com) — local models on your own machine
+with no API keys or per-token bills, or Ollama's cloud models when you want
+more capability. Your code never leaves your machine unless you choose a
+cloud model.
 
 ![Sidebar chat, autonomous tool use, diff previews before every file change](media/icon.png)
+
+## Why this instead of Cline/Continue?
+
+| | Cortex |
+|---|---|
+| **Language-server aware** | `find_symbol` / `find_references` use VS Code's real symbol providers; a `diagnostics` tool surfaces actual compiler errors, and they're fed back automatically after every edit |
+| **Measured, not vibes** | A [benchmark suite](#benchmarks) grades the agent on the files it produces. Changes are proven, not guessed |
+| **Safe by construction** | Destructive commands (`rm -rf`, `curl \| sh`, `sudo`, force-push, credential reads) can never be auto-approved by *any* policy — because file contents reaching the model are untrusted input |
+| **Fast where it counts** | Read-only tool calls run in parallel — a three-file read costs two model round-trips, not four |
+| **Yours** | Local-first, MIT, no account, no telemetry |
+
+## Benchmarks
+
+```bash
+npm run eval -- --model qwen2.5-coder:7b          # score one model
+npm run eval -- --model a --model b               # compare two
+npm run eval -- --save-baseline                   # pin a baseline
+```
+
+Every task builds a throwaway workspace, gives the agent one prompt, and
+grades the **resulting files** — an agent that describes a correct patch but
+never writes it scores zero. Runs exit non-zero on a regression, so this
+works as a CI gate.
 
 ## Features
 

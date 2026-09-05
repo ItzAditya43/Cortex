@@ -3,7 +3,7 @@
   "displayName": "Cortex",
   "description": "A local, private coding agent for VS Code \u2014 like Cline, but powered entirely by your own Ollama models. No API keys, no cloud.",
   "version": "0.1.0",
-  "publisher": "cortex",
+  "publisher": "ItzAditya43",
   "license": "MIT",
   "type": "module",
   "main": "./src/extension.cjs",
@@ -31,7 +31,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/cortex/cortex"
+    "url": "https://github.com/ItzAditya43/Cortex"
   },
   "activationEvents": [],
   "contributes": {
@@ -341,15 +341,20 @@
     }
   },
   "scripts": {
-    "package": "vsce package --no-dependencies",
-    "publish": "vsce publish --no-dependencies",
+    "package": "@vscode/vsce package --no-dependencies",
+    "publish": "@vscode/vsce publish --no-dependencies",
     "test": "node --test test/**/*.test.cjs",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "eval": "node eval/run.cjs"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^2.32.0",
     "typescript": "^5.9.3"
-  }
+  },
+  "bugs": {
+    "url": "https://github.com/ItzAditya43/Cortex/issues"
+  },
+  "homepage": "https://github.com/ItzAditya43/Cortex#readme"
 }
