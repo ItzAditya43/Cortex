@@ -16,7 +16,7 @@
 const { chat } = require('./provider.cjs');
 const { parseToolCall } = require('./agentLoop.cjs');
 
-const TIMEOUT_MS = 45_000;
+const DEFAULT_TIMEOUT_MS = 45_000;
 
 async function ask(cfg, messages, { signal } = {}) {
   return chat({
@@ -135,7 +135,7 @@ async function probeNativeTools(cfg) {
           },
         ],
       }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: AbortSignal.timeout(cfg.timeoutMs || DEFAULT_TIMEOUT_MS),
     });
     if (!res.ok) return { ok: false, strict: false, detail: `server rejected tools (HTTP ${res.status})` };
     const data = await res.json();
@@ -176,7 +176,7 @@ async function probeModel(cfg, onStep) {
     try {
       r = await Promise.race([
         probe.run(cfg),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('probe timed out')), TIMEOUT_MS)),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('probe timed out')), cfg.timeoutMs || DEFAULT_TIMEOUT_MS)),
       ]);
     } catch (err) {
       r = { ok: false, strict: false, detail: err.message, inconclusive: true };
@@ -197,13 +197,19 @@ async function probeModel(cfg, onStep) {
   }
 
   const inconclusive = Object.values(results).filter((r) => r.inconclusive);
-  const score = possible > 0 ? Math.round((earned / possible) * 100) : null;
+  const completed = PROBES.length - inconclusive.length;
+  // A percentage computed from one surviving probe is not a score — showing
+  // "100/100" beside an inconclusive verdict reads as a perfect result. Only
+  // report a number when enough of the suite actually ran.
+  const enoughRan = completed >= 3;
+  const score = possible > 0 && enoughRan ? Math.round((earned / possible) * 100) : null;
+  const partialScore = possible > 0 ? Math.round((earned / possible) * 100) : null;
 
   let verdict;
-  if (score === null) {
+  if (completed === 0) {
     verdict = 'Inconclusive — every probe timed out. The server is busy or the model is still loading; try again.';
-  } else if (inconclusive.length >= PROBES.length - 1) {
-    verdict = `Inconclusive — only one probe completed (${inconclusive.length} timed out). Try again when the server is idle.`;
+  } else if (!enoughRan) {
+    verdict = `Inconclusive — only ${completed} of ${PROBES.length} probes completed (${inconclusive.length} timed out). Try again when the server is idle.`;
   } else if (results.protocol && results.protocol.ok === false && !results.protocol.inconclusive) {
     verdict = 'Not usable for agent work — it cannot produce a tool call.';
   } else if (score >= 80) {
@@ -219,14 +225,14 @@ async function probeModel(cfg, onStep) {
 
   // Never recommend a configuration change off an inconclusive run.
   const recommended = {};
-  const trustworthy = score !== null && inconclusive.length < PROBES.length - 1;
+  const trustworthy = score !== null;
   if (trustworthy && results.protocol.ok) {
     if (score >= 70) recommended.model = cfg.model;
     else recommended.fastModel = cfg.model;
   }
   if (results.native.ok) recommended.nativeTools = true;
 
-  return { model: cfg.model, results, score, verdict, recommended, inconclusive: inconclusive.length, trustworthy };
+  return { model: cfg.model, results, score, partialScore, completed, verdict, recommended, inconclusive: inconclusive.length, trustworthy };
 }
 
 module.exports = { probeModel, PROBES };

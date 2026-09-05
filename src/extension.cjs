@@ -337,7 +337,7 @@ function activate(context) {
         async (progress) => probeModel({ ...cfg, model: picked }, (_id, label) => progress.report({ message: label }))
       );
       const lines = [
-        `# ${report.model} — ${report.score}/100`,
+        `# ${report.model} — ${report.score === null ? 'not scored' : `${report.score}/100`}`,
         '',
         report.verdict,
         '',
