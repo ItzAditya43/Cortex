@@ -195,6 +195,7 @@ class ChatViewProvider {
   <div id="panel-memory" class="panel hidden"></div>
   <div id="banner" class="hidden"></div>
   <div id="messages"></div>
+  <button id="jump-bottom" class="hidden" title="Jump to latest">&#8595; Latest</button>
   <div id="composer">
     <input type="file" id="image-input" accept="image/*" class="hidden">
     <textarea id="input" placeholder="Ask Cortex to do something in this workspace..." rows="3"></textarea>

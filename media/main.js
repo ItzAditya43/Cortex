@@ -8,6 +8,7 @@
   const bannerEl = document.getElementById('banner');
   const modelBadge = document.getElementById('model-badge');
   const sessionStatsEl = document.getElementById('session-stats');
+  const jumpBtn = document.getElementById('jump-bottom');
   const historyBtn = document.getElementById('history-btn');
   const approvalsBtn = document.getElementById('approvals-btn');
   const memoryBtn = document.getElementById('memory-btn');
@@ -139,8 +140,31 @@
     });
   }
 
-  function scrollToBottom() {
+  // Stick-to-bottom, rather than force-to-bottom.
+  //
+  // scrollToBottom() runs on every streamed token. Unconditionally jumping to
+  // the end means that while a reply streams, any attempt to scroll up is
+  // undone milliseconds later — the transcript is not unscrollable, it is
+  // being yanked back several times a second, which is indistinguishable from
+  // broken. So: follow the tail only while the reader is already at the tail,
+  // and stop the moment they scroll away.
+  let stickToBottom = true;
+  const NEAR_BOTTOM_PX = 40;
+
+  function atBottom() {
+    return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight <= NEAR_BOTTOM_PX;
+  }
+
+  messagesEl.addEventListener('scroll', () => {
+    stickToBottom = atBottom();
+    if (jumpBtn) jumpBtn.classList.toggle('hidden', stickToBottom);
+  });
+
+  function scrollToBottom(force) {
+    if (!force && !stickToBottom) return; // the reader is looking at something
     messagesEl.scrollTop = messagesEl.scrollHeight;
+    stickToBottom = true;
+    if (jumpBtn) jumpBtn.classList.add('hidden');
   }
 
   function showEmptyState() {
@@ -169,7 +193,7 @@
     clearEmptyState();
     const div = document.createElement('div');
     div.className = 'msg user';
-    if (image) {
+    if (typeof image === 'string' && image.startsWith('data:')) {
       const img = document.createElement('img');
       img.src = image;
       img.className = 'msg-attached-image';
@@ -183,7 +207,7 @@
     messagesEl.appendChild(div);
     currentAssistantEl = null;
     currentAssistantBuf = '';
-    scrollToBottom();
+    scrollToBottom(true); // sending is an explicit request to see the newest message
   }
 
   function addSystemNote(text) {
@@ -483,6 +507,8 @@
       imageInput.value = '';
     });
   }
+
+  if (jumpBtn) jumpBtn.addEventListener('click', () => scrollToBottom(true));
 
   sendBtn.addEventListener('click', send);
   stopBtn.addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
