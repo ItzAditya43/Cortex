@@ -212,7 +212,10 @@ async function runTurn(opts) {
     try {
       reply = await chat({ host, provider, apiKey, model: activeModel, messages, temperature, signal, onToken, onUsage, logFn: onLog });
     } catch (err) {
-      if (err.name === 'AbortError') return;
+      // Only stay silent when the USER actually cancelled. Any other abort
+      // (a stalled model, a dropped connection) must be reported, or the
+      // turn just ends with no output and no explanation.
+      if (err.name === 'AbortError' && signal?.aborted) return;
       onLog?.(`step ${steps}: error — ${err.message}`);
       onError(err.message);
       return;

@@ -93,6 +93,22 @@ async function chat({ host, model, messages, temperature = 0.2, onToken, onUsage
   let full = '';
   let buf = '';
 
+  // Aborting the fetch is what unblocks a stalled read, but it surfaces as a
+  // generic "This operation was aborted" from the stream iterator — which
+  // reaches the user as a meaningless message. Catch it here so the reason
+  // the stream ended (idle timeout vs. user cancel) is what gets reported.
+  const explainStreamEnd = (err) => {
+    if (timedOut) {
+      return Object.assign(
+        new Error(
+          `Ollama stopped responding (no output for ${IDLE_TIMEOUT_MS / 1000}s). The model may be overloaded or still loading — try again, or switch models.`
+        ),
+        { name: 'TimeoutError' }
+      );
+    }
+    return err;
+  };
+
   try {
     for await (const bytes of res.body) {
       resetIdleTimer();
@@ -129,13 +145,24 @@ async function chat({ host, model, messages, temperature = 0.2, onToken, onUsage
       }
     }
     if (timedOut) {
-      throw Object.assign(new Error(`Ollama stopped responding (no output for ${IDLE_TIMEOUT_MS / 1000}s)`), { name: 'AbortError' });
+      // Deliberately NOT named AbortError: callers treat that as "the user
+      // pressed Stop" and end the turn silently, which would make a stalled
+      // model look identical to a cancelled one — silence, with no
+      // explanation of why nothing happened.
+      throw Object.assign(
+        new Error(
+          `Ollama stopped responding (no output for ${IDLE_TIMEOUT_MS / 1000}s). The model may be overloaded or still loading — try again, or switch models.`
+        ),
+        { name: 'TimeoutError' }
+      );
     }
     if (signal?.aborted) {
       throw Object.assign(new Error('aborted'), { name: 'AbortError' });
     }
     logFn?.(`response ${full.length} chars (stream ended without done:true)`);
     return full;
+  } catch (err) {
+    throw explainStreamEnd(err);
   } finally {
     clearTimeout(idleTimer);
     signal?.removeEventListener('abort', onOuterAbort);

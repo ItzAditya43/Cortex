@@ -144,6 +144,10 @@ const tasks = [
     tags: ['restraint'],
     files: { 'fine.js': 'const PORT = 8080;\nmodule.exports = { PORT };\n' },
     prompt: 'Check whether fine.js sets PORT to 8080. If it already does, do not change anything — just tell me.',
+    // Restraint tasks need proof the agent actually engaged: a stalled agent
+    // also "changes nothing", so file-state alone would score a hang as a
+    // pass. Requiring a real answer distinguishes restraint from silence.
+    needsAnswer: true,
     check: (dir) => {
       const src = read(dir, 'fine.js');
       if (src !== 'const PORT = 8080;\nmodule.exports = { PORT };\n') {

@@ -116,7 +116,14 @@ async function runTask(task, model, opts) {
     verdict = `check threw: ${err.message}`;
   }
 
-  const passed = verdict === true;
+  // A task that only checks "nothing changed" would score a hung agent as a
+  // pass. needsAnswer tasks additionally require the agent to have actually
+  // responded.
+  let passed = verdict === true;
+  if (passed && task.needsAnswer && !finalText.trim()) {
+    passed = false;
+    verdict = 'agent never produced an answer (stalled or gave up)';
+  }
   const result = {
     task: task.name,
     tags: task.tags,
