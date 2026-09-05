@@ -7,6 +7,10 @@ const { startScheduler, stopScheduler } = require('./scheduler.cjs');
 const { startMcpServers, stopMcpServers } = require('./mcpManager.cjs');
 const codeIndex = require('./codeIndex.cjs');
 const terminalIntegration = require('./terminal.cjs');
+const { probeModel } = require('./modelProbe.cjs');
+const { benchmarkModels } = require('./modelBench.cjs');
+const audit = require('./auditLog.cjs');
+const { chat } = require('./provider.cjs');
 const logger = require('./logger.cjs');
 
 function activate(context) {
@@ -249,6 +253,218 @@ function activate(context) {
       }
       await vscode.commands.executeCommand('workbench.view.extension.cortex');
       await provider.onSend('Explain the selected code and what it does.');
+    })
+  );
+
+  const cfgOf = () => {
+    const c = vscode.workspace.getConfiguration('cortex');
+    return { host: c.get('host'), provider: c.get('provider') || 'ollama', apiKey: c.get('apiKey') || '', model: c.get('model') };
+  };
+  const rootOf = () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+  // Send a terminal selection straight to the agent — debugging a failed
+  // command is the most common reason to open an assistant at all, and
+  // copy-pasting a stack trace is pure friction.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cortex.addTerminalOutputToChat', async () => {
+      await vscode.commands.executeCommand('workbench.action.terminal.copySelection');
+      const text = await vscode.env.clipboard.readText();
+      if (!text || !text.trim()) {
+        vscode.window.showWarningMessage('Cortex: select some terminal output first.');
+        return;
+      }
+      await vscode.commands.executeCommand('workbench.view.extension.cortex');
+      provider.post({ type: 'insertText', text: `Terminal output:\n\n\u0060\u0060\u0060\n${text.trim().slice(0, 4000)}\n\u0060\u0060\u0060\n\n` });
+    })
+  );
+
+  // Commit message generation, driven by the real diff rather than the
+  // file names — the tools already existed, only the button was missing.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cortex.generateCommitMessage', async () => {
+      const root = rootOf();
+      if (!root) return;
+      const { tools } = require('./tools.cjs');
+      const diff = tools.git_diff.run({ staged: true }, root);
+      const effective = /no changes/i.test(diff) ? tools.git_diff.run({}, root) : diff;
+      if (/^ERROR|no changes/i.test(effective)) {
+        vscode.window.showInformationMessage('Cortex: nothing to commit.');
+        return;
+      }
+      await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.SourceControl, title: 'Cortex: writing commit message' },
+        async () => {
+          try {
+            const msg = await chat({
+              ...cfgOf(),
+              temperature: 0.2,
+              messages: [
+                {
+                  role: 'system',
+                  content:
+                    'Write a git commit message for this diff. First line: imperative mood, under 72 characters, no trailing period. Then a blank line and a short body explaining WHY, only if the reason is not obvious. Output the message only.',
+                },
+                { role: 'user', content: effective.slice(0, 12000) },
+              ],
+            });
+            const git = vscode.extensions.getExtension('vscode.git')?.exports?.getAPI(1);
+            const repo = git?.repositories?.[0];
+            if (repo) repo.inputBox.value = msg.trim();
+            else vscode.window.showInformationMessage(msg.trim());
+          } catch (err) {
+            vscode.window.showErrorMessage(`Cortex: could not generate a message (${err.message})`);
+          }
+        }
+      );
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cortex.openWalkthrough', () =>
+      vscode.commands.executeCommand('workbench.action.openWalkthrough', 'ItzAditya43.cortex#cortexGettingStarted', false)
+    )
+  );
+
+  // Probe what THIS model on THIS machine can actually do, and offer to
+  // configure the extension from the answer rather than from its name.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cortex.probeModel', async () => {
+      const cfg = cfgOf();
+      const picked = await vscode.window.showInputBox({ prompt: 'Model to probe', value: cfg.model });
+      if (!picked) return;
+      const report = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `Probing ${picked}`, cancellable: false },
+        async (progress) => probeModel({ ...cfg, model: picked }, (_id, label) => progress.report({ message: label }))
+      );
+      const lines = [
+        `# ${report.model} — ${report.score}/100`,
+        '',
+        report.verdict,
+        '',
+        ...Object.values(report.results).map((r) => `- ${r.strict ? '✅' : r.ok ? '⚠️' : '❌'} **${r.label}** — ${r.detail}`),
+      ];
+      const doc = await vscode.workspace.openTextDocument({ content: lines.join('\n'), language: 'markdown' });
+      await vscode.window.showTextDocument(doc, { preview: true });
+
+      if (report.recommended.model || report.recommended.fastModel) {
+        const target = report.recommended.model ? 'cortex.model' : 'cortex.fastModel';
+        const choice = await vscode.window.showInformationMessage(
+          `Set ${picked} as your ${report.recommended.model ? 'main model' : 'fast model'}?`,
+          'Yes'
+        );
+        if (choice === 'Yes') {
+          await vscode.workspace
+            .getConfiguration()
+            .update(target, picked, vscode.ConfigurationTarget.Global);
+        }
+      }
+    })
+  );
+
+  // Rank the models already installed on this machine on real tasks. Published
+  // benchmarks cannot answer this: the quantisation, RAM and GPU are the user's.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cortex.benchmarkModels', async () => {
+      const cfg = cfgOf();
+      let available = [];
+      try {
+        available = (await listModels(cfg)).map((m) => m.name);
+      } catch (err) {
+        vscode.window.showErrorMessage(`Cortex: could not list models (${err.message})`);
+        return;
+      }
+      const chosen = await vscode.window.showQuickPick(available, {
+        canPickMany: true,
+        placeHolder: 'Pick the models to score (2-4 is a sensible run)',
+      });
+      if (!chosen || chosen.length === 0) return;
+
+      const rows = await vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: 'Cortex: benchmarking your models', cancellable: false },
+        async (progress) =>
+          benchmarkModels(chosen, cfg, (p) =>
+            progress.report({ message: `${p.model} — ${p.task} (${p.index}/${p.total})` })
+          )
+      );
+
+      const md = [
+        '# Your models, ranked',
+        '',
+        'Scored by running the real agent loop over real tasks in a scratch workspace,',
+        'graded on the files produced — not on what the model said it did.',
+        '',
+        '| Rank | Model | Passed | Avg time |',
+        '|---|---|---|---|',
+        ...rows.map((r, i) => `| ${i + 1} | \`${r.model}\` | ${r.passed}/${r.scored} | ${(r.avgMs / 1000).toFixed(1)}s |`),
+        '',
+        '## Detail',
+        ...rows.flatMap((r) => [
+          '',
+          `### ${r.model}`,
+          ...r.results.map((t) => `- ${t.passed ? '✅' : t.infra ? '⚠️ (stalled, not scored)' : '❌'} ${t.task}`),
+        ]),
+      ].join('\n');
+      const doc = await vscode.workspace.openTextDocument({ content: md, language: 'markdown' });
+      await vscode.window.showTextDocument(doc, { preview: false });
+
+      const best = rows[0];
+      if (best && best.rate > 0) {
+        const choice = await vscode.window.showInformationMessage(
+          `${best.model} scored highest (${best.passed}/${best.scored}). Use it?`,
+          'Set as my model'
+        );
+        if (choice) await vscode.workspace.getConfiguration().update('cortex.model', best.model, vscode.ConfigurationTarget.Global);
+      }
+    })
+  );
+
+  // The inverse of telemetry: the same completeness, on the user's disk,
+  // answering the user's question rather than a vendor's.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cortex.showAuditLog', async () => {
+      const root = rootOf();
+      if (!root) return;
+      const doc = await vscode.workspace.openTextDocument({ content: audit.renderReport(root, 7), language: 'markdown' });
+      await vscode.window.showTextDocument(doc, { preview: true });
+    })
+  );
+
+  // Three questions instead of twenty-three settings.
+  context.subscriptions.push(
+    vscode.commands.registerCommand('cortex.setup', async () => {
+      const c = vscode.workspace.getConfiguration('cortex');
+      const host = await vscode.window.showInputBox({ prompt: 'Where is Ollama running?', value: c.get('host') });
+      if (host === undefined) return;
+      await c.update('host', host, vscode.ConfigurationTarget.Global);
+
+      let models = [];
+      try {
+        models = (await listModels({ host, provider: 'ollama' })).map((m) => m.name);
+      } catch {
+        vscode.window.showWarningMessage(`Cortex: could not reach Ollama at ${host}. Start it with "ollama serve", then run Setup again.`);
+        return;
+      }
+      if (models.length === 0) {
+        vscode.window.showWarningMessage('Cortex: no models installed. Try "ollama pull qwen2.5-coder:7b", then run Setup again.');
+        return;
+      }
+      const model = await vscode.window.showQuickPick(models, { placeHolder: 'Which model should Cortex use?' });
+      if (!model) return;
+      await c.update('model', model, vscode.ConfigurationTarget.Global);
+
+      const safety = await vscode.window.showQuickPick(
+        [
+          { label: 'Ask me first', description: 'Approve every file change and command (recommended)', v: 'untrusted' },
+          { label: 'Auto-approve contained changes', description: 'Sandboxed edits and commands run without asking', v: 'on-request' },
+          { label: "Don't ask", description: 'Run everything unattended — destructive commands still ask', v: 'never' },
+        ],
+        { placeHolder: 'How much should Cortex check with you?' }
+      );
+      if (safety) await c.update('approvalPolicy', safety.v, vscode.ConfigurationTarget.Global);
+
+      const next = await vscode.window.showInformationMessage(`Cortex is set up with ${model}.`, 'Open chat', 'Score my models');
+      if (next === 'Open chat') vscode.commands.executeCommand('cortex.openChat');
+      if (next === 'Score my models') vscode.commands.executeCommand('cortex.benchmarkModels');
     })
   );
 }

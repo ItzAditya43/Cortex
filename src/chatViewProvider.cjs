@@ -23,6 +23,7 @@ const { generateProjectRules } = require('./initRules.cjs');
 const { saveSnapshot, loadSnapshots, deleteSnapshot, clearSession, pruneOldSessions } = require('./checkpoints.cjs');
 const { clearTasks } = require('./taskList.cjs');
 const { markAgentWrite, getStaleWarning } = require('./fileTracker.cjs');
+const audit = require('./auditLog.cjs');
 const logger = require('./logger.cjs');
 
 const MUTATING_TOOLS = Object.entries(tools)
@@ -626,6 +627,15 @@ class ChatViewProvider {
     const planMode = this.mode === 'plan';
     const startedAt = Date.now();
     const turnCallIds = [];
+    audit.turnStarted(root, {
+      sessionId: this.sessionId,
+      model: cfg.model,
+      prompt: text,
+      mode: this.mode,
+      approvalPolicy: cfg.approvalPolicy,
+      sandboxMode: cfg.sandboxMode,
+    });
+    audit.prune(root);
     const turnId = nonce().slice(0, 8); // groups this turn's snapshots so a whole turn can be reverted after a reload
     // Remember where this turn begins so a later rewind can cut the
     // conversation back to exactly this point.
@@ -678,6 +688,9 @@ class ChatViewProvider {
           this.post({ type: 'usage', ...u, contextBudget: cfg.contextBudgetTokens });
         },
         onToolCall: (name, args, callId) => {
+          this.lastToolName = name;
+          this.lastToolArgs = args;
+          this.lastToolAutoApproved = undefined;
           this.post({ type: 'toolCall', name, args, id: callId });
         },
         requestApproval: async (name, args, callId) => {
@@ -691,8 +704,21 @@ class ChatViewProvider {
               sandboxMode: cfg.sandboxMode,
               toolKind: tools[name]?.kind,
             })
-          )
+          ) {
+            this.lastToolAutoApproved = true;
             return true;
+          }
+          // Reaching here with a dangerous command means the safety floor
+          // refused to auto-approve it — worth recording even if the user
+          // then approves it by hand.
+          if (tools[name]?.kind === 'command' && args.command) {
+            const { classifyCommand } = require('./dangerousCommands.cjs');
+            const risk = classifyCommand(args.command);
+            if (risk.dangerous) {
+              audit.blocked(root, { sessionId: this.sessionId, tool: name, reason: risk.why, detail: `${args.command} — ${risk.why}` });
+              this.post({ type: 'dangerWarning', id: callId, why: risk.why });
+            }
+          }
           if (cfg.approveForMe) {
             const review = await reviewAction(
               { host: cfg.host, provider: cfg.provider, apiKey: cfg.apiKey, model: cfg.fastModel || cfg.model },
@@ -706,6 +732,17 @@ class ChatViewProvider {
           return this.requestApproval(name, args, callId);
         },
         onToolResult: (result, isError, callId, snapshot) => {
+          audit.toolRan(root, {
+            sessionId: this.sessionId,
+            tool: this.lastToolName,
+            args: this.lastToolArgs,
+            approved: this.lastToolAutoApproved,
+            isError,
+            resultPreview: result,
+          });
+          if (snapshot) {
+            audit.fileChanged(root, { sessionId: this.sessionId, file: snapshot.path, before: snapshot.before, after: snapshot.after });
+          }
           if (snapshot && callId) {
             this.revertable.set(callId, snapshot);
             turnCallIds.push(callId);

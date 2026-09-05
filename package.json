@@ -16,7 +16,8 @@
     "node": ">=18"
   },
   "categories": [
-    "Machine Learning",
+    "AI",
+    "Chat",
     "Programming Languages",
     "Other"
   ],
@@ -27,13 +28,23 @@
     "cline",
     "local llm",
     "coding assistant",
-    "chat"
+    "chat",
+    "copilot",
+    "autocomplete",
+    "llm",
+    "qwen",
+    "llama",
+    "deepseek",
+    "offline",
+    "privacy"
   ],
   "repository": {
     "type": "git",
     "url": "https://github.com/ItzAditya43/Cortex"
   },
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "contributes": {
     "viewsContainers": {
       "activitybar": [
@@ -106,6 +117,42 @@
         "command": "cortex.buildCodeIndex",
         "title": "Build Code Index (semantic search)",
         "category": "Cortex"
+      },
+      {
+        "command": "cortex.addTerminalOutputToChat",
+        "title": "Add Terminal Output to Cortex",
+        "category": "Cortex"
+      },
+      {
+        "command": "cortex.generateCommitMessage",
+        "title": "Generate Commit Message with Cortex",
+        "category": "Cortex",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "cortex.openWalkthrough",
+        "title": "Open Walkthrough",
+        "category": "Cortex"
+      },
+      {
+        "command": "cortex.setup",
+        "title": "Setup (first-run wizard)",
+        "category": "Cortex"
+      },
+      {
+        "command": "cortex.benchmarkModels",
+        "title": "Benchmark My Models",
+        "category": "Cortex"
+      },
+      {
+        "command": "cortex.showAuditLog",
+        "title": "Show Session Audit Log",
+        "category": "Cortex"
+      },
+      {
+        "command": "cortex.probeModel",
+        "title": "Probe Model Capabilities",
+        "category": "Cortex"
       }
     ],
     "menus": {
@@ -131,6 +178,19 @@
           "command": "cortex.explainSelection",
           "when": "editorHasSelection",
           "group": "cortex@2"
+        }
+      ],
+      "terminal/context": [
+        {
+          "command": "cortex.addTerminalOutputToChat",
+          "group": "cortex@1"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "cortex.generateCommitMessage",
+          "when": "scmProvider == git",
+          "group": "navigation"
         }
       ]
     },
@@ -338,7 +398,48 @@
           "description": "Run shell commands in VS Code's visible integrated terminal (so you can watch them) instead of a hidden child process. Requires shell integration; falls back automatically when unavailable, and is bypassed for sandboxed commands."
         }
       }
-    }
+    },
+    "walkthroughs": [
+      {
+        "id": "cortexGettingStarted",
+        "title": "Set up Cortex",
+        "description": "A coding agent that runs on your own machine and uses your editor's language server.",
+        "steps": [
+          {
+            "id": "ollama",
+            "title": "Install and start Ollama",
+            "description": "Cortex talks to Ollama on your own machine. Install it from https://ollama.com, then run `ollama serve`.\n[Check connection](command:cortex.setup)",
+            "media": {
+              "markdown": "media/walkthrough-ollama.md"
+            }
+          },
+          {
+            "id": "model",
+            "title": "Pull a coding model",
+            "description": "Run `ollama pull qwen2.5-coder:7b` in a terminal, then pick it here.\n[Select Model](command:cortex.selectModel)",
+            "media": {
+              "markdown": "media/walkthrough-model.md"
+            }
+          },
+          {
+            "id": "safety",
+            "title": "Choose how much to approve",
+            "description": "Cortex asks before changing files by default. Destructive commands always ask, whatever you pick.\n[Run Setup](command:cortex.setup)",
+            "media": {
+              "markdown": "media/walkthrough-safety.md"
+            }
+          },
+          {
+            "id": "first",
+            "title": "Try it",
+            "description": "Open the Cortex panel and ask it to `list the files here`.\n[Open Cortex](command:cortex.openChat)",
+            "media": {
+              "markdown": "media/walkthrough-first.md"
+            }
+          }
+        ]
+      }
+    ]
   },
   "scripts": {
     "package": "@vscode/vsce package --no-dependencies",

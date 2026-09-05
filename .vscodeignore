@@ -10,3 +10,4 @@ test/**
 .eslintrc*
 tsconfig.json
 eval/**
+SMOKE-TEST.md

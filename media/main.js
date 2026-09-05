@@ -740,6 +740,15 @@
         restoreSession(msg.messages);
         addSystemNote(`Rewound \u2014 restored ${msg.paths.length} file(s): ${msg.paths.join(', ') || 'none'}`);
         break;
+      case 'dangerWarning': {
+        const block = findToolBlock(msg.id);
+        const warn = document.createElement('div');
+        warn.className = 'danger-warning';
+        warn.textContent = `\u26a0 Flagged as dangerous: ${msg.why}. This can never be auto-approved.`;
+        (block || messagesEl).appendChild(warn);
+        scrollToBottom();
+        break;
+      }
       case 'usage':
         sessionStats.promptTokens += msg.promptTokens || 0;
         sessionStats.completionTokens += msg.completionTokens || 0;

@@ -35,6 +35,7 @@ function parseArgs(argv) {
     verbose: false,
     json: false,
     saveBaseline: false,
+    repeat: 1,
     timeoutMs: 180_000,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -49,6 +50,7 @@ function parseArgs(argv) {
     else if (a === '--verbose' || a === '-v') opts.verbose = true;
     else if (a === '--json') opts.json = true;
     else if (a === '--save-baseline') opts.saveBaseline = true;
+    else if (a === '--repeat') opts.repeat = Math.max(1, parseInt(argv[++i], 10) || 1);
     else if (a === '--help' || a === '-h') {
       console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 17).join('\n').replace(/^\/\/ ?/gm, ''));
       process.exit(0);
@@ -181,35 +183,71 @@ async function main() {
     if (!opts.json) console.log(`\n=== ${model} — ${selected.length} task(s) ===`);
     const results = [];
     for (const task of selected) {
-      let r = await runTask(task, model, opts);
-      // One retry for infrastructure stalls before believing the result.
-      if (!r.passed && isInfraFailure(r)) {
-        if (!opts.json) console.log(`  \x1b[33mRETRY\x1b[0m ${task.name} (model stalled, not an agent failure)`);
-        r = await runTask(task, model, opts);
+      // Repeat each task N times. A single run of a sampled model carries no
+      // confidence at all — three consecutive full runs of this suite scored
+      // 10/12, 7/12 and 4/12 on unchanged code. pass@k (did it ever succeed)
+      // and pass^k (did it succeed every time) are the numbers that mean
+      // something, and the gap between them is the flakiness.
+      const attempts = [];
+      for (let n = 0; n < opts.repeat; n++) {
+        let r = await runTask(task, model, opts);
+        // One retry for infrastructure stalls before believing the result.
+        if (!r.passed && isInfraFailure(r)) {
+          if (!opts.json) console.log(`  \x1b[33mRETRY\x1b[0m ${task.name} (model stalled, not an agent failure)`);
+          r = await runTask(task, model, opts);
+        }
+        r.infra = !r.passed && isInfraFailure(r);
+        attempts.push(r);
       }
-      r.infra = !r.passed && isInfraFailure(r);
+
+      const scoredAttempts = attempts.filter((a) => !a.infra);
+      const passes = scoredAttempts.filter((a) => a.passed).length;
+      const r = {
+        ...attempts[0],
+        attempts: attempts.length,
+        passes,
+        scoredAttempts: scoredAttempts.length,
+        passed: passes > 0, // pass@k
+        always: scoredAttempts.length > 0 && passes === scoredAttempts.length, // pass^k
+        flaky: passes > 0 && passes < scoredAttempts.length,
+        infra: scoredAttempts.length === 0,
+      };
       results.push(r);
+
       if (!opts.json) {
-        const mark = r.passed ? '\x1b[32mPASS\x1b[0m' : r.infra ? '\x1b[33mINFRA\x1b[0m' : '\x1b[31mFAIL\x1b[0m';
-        console.log(`  ${mark}  ${r.task.padEnd(28)} ${String(r.steps).padStart(2)} steps  ${(r.ms / 1000).toFixed(1)}s`);
+        const mark = r.infra
+          ? '\x1b[33mINFRA\x1b[0m'
+          : r.always
+            ? '\x1b[32mPASS \x1b[0m'
+            : r.flaky
+              ? '\x1b[33mFLAKY\x1b[0m'
+              : '\x1b[31mFAIL \x1b[0m';
+        const tally = opts.repeat > 1 ? ` ${r.passes}/${r.scoredAttempts}` : '';
+        console.log(`  ${mark} ${r.task.padEnd(28)}${tally.padEnd(6)} ${String(r.steps).padStart(2)} steps  ${(r.ms / 1000).toFixed(1)}s`);
         if (!r.passed) console.log(`        ↳ ${r.reason}${r.error ? ` (loop error: ${r.error})` : ''}`);
         if (opts.verbose) console.log(`        tools: ${r.tools.join(' → ') || '(none)'}`);
       }
     }
     const passed = results.filter((r) => r.passed).length;
+    const always = results.filter((r) => r.always).length;
+    const flaky = results.filter((r) => r.flaky).length;
     const infra = results.filter((r) => r.infra).length;
     const scored = results.length - infra; // infra failures say nothing about agent quality
     report.models[model] = {
       passed,
+      always,
+      flaky,
       total: results.length,
       infra,
       scored,
+      repeat: opts.repeat,
       rate: scored > 0 ? passed / scored : 0,
       results,
     };
     if (!opts.json) {
       console.log(
-        `  ---- ${passed}/${scored} (${scored > 0 ? Math.round((passed / scored) * 100) : 0}%)` +
+        `  ---- pass@${opts.repeat}: ${passed}/${scored} (${scored > 0 ? Math.round((passed / scored) * 100) : 0}%)` +
+          (opts.repeat > 1 ? `  pass^${opts.repeat}: ${always}/${scored}${flaky ? `  \x1b[33m${flaky} flaky\x1b[0m` : ''}` : '') +
           (infra ? `  \x1b[33m[${infra} excluded: model/server stalled, not agent quality]\x1b[0m` : '')
       );
       const prev = baseline?.models?.[model];

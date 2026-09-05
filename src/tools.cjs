@@ -20,7 +20,19 @@ const lsp = require('./lsp.cjs');
 const codeIndex = require('./codeIndex.cjs');
 const terminal = require('./terminal.cjs');
 
-const MAX_RESULT_CHARS = 8000;
+// Per-tool output budgets. A single global cap silently cut large file reads
+// mid-function, and the agent then edited against a file it had only half
+// seen — a correctness failure, not a display one. Reads and command output
+// get real room; the line caps bound pathological files (minified bundles,
+// generated code) independently of the total.
+const LIMITS = {
+  read: 48_000,
+  command: 48_000,
+  search: 48_000,
+  default: 12_000,
+  maxLines: 2_000,
+  maxLineChars: 2_000,
+};
 
 // Long-running background processes (dev servers, watchers) started via
 // run_background, keyed by an id handed back to the model so it can poll
@@ -29,10 +41,21 @@ const MAX_RESULT_CHARS = 8000;
 const backgroundProcs = new Map(); // id -> {proc, output: string[], exitCode: number|null}
 let backgroundIdCounter = 0;
 
-function truncate(s) {
+function truncate(s, limit = LIMITS.default) {
   if (typeof s !== 'string') s = String(s);
-  if (s.length <= MAX_RESULT_CHARS) return s;
-  return s.slice(0, MAX_RESULT_CHARS) + `\n...[truncated ${s.length - MAX_RESULT_CHARS} more characters]`;
+  if (s.length <= limit) return s;
+  return s.slice(0, limit) + `\n...[truncated ${s.length - limit} more characters]`;
+}
+
+// Bounds a file's text by lines and per-line length before the total-size cap,
+// so one pathological line can't consume the whole budget and hide the rest.
+function clampFileText(text) {
+  const lines = text.split('\n');
+  const clippedLines = lines.slice(0, LIMITS.maxLines).map((l) =>
+    l.length > LIMITS.maxLineChars ? `${l.slice(0, LIMITS.maxLineChars)} …[${l.length - LIMITS.maxLineChars} more chars on this line]` : l
+  );
+  const note = lines.length > LIMITS.maxLines ? `\n...[${lines.length - LIMITS.maxLines} more lines not shown]` : '';
+  return clippedLines.join('\n') + note;
 }
 
 // Resolve a user/model-supplied relative path against the workspace root,
@@ -113,17 +136,41 @@ const NOT_FOUND_HINT =
 
 const tools = {
   read_file: {
-    description: 'Read a file\'s contents (with line numbers). Arguments: {"path": string}',
+    description:
+      'Read one file, or several at once. Prefer passing an array — reading four files in one call costs one round-trip instead of four. Arguments: {"path": string} or {"path": string[]}',
     confirm: false,
     readOnly: true,
+    // Batching is part of the contract rather than something recovered by
+    // parsing several tool-call lines out of one response, so the model
+    // cannot express it in a shape we then have to repair.
+    schema: {
+      type: 'object',
+      properties: {
+        path: {
+          description: 'A workspace-relative file path, or an array of them to read together.',
+          anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' }, maxItems: 12 }],
+        },
+      },
+      required: ['path'],
+    },
     run: ({ path: p }, root) => {
+      if (Array.isArray(p)) {
+        if (p.length === 0) return 'ERROR: path array is empty';
+        return truncate(
+          p.map((one) => `--- ${one} ---\n${tools.read_file.run({ path: one }, root)}`).join('\n\n'),
+          LIMITS.read
+        );
+      }
       const full = safePath(root, p);
       if (!fs.existsSync(full)) return `ERROR: file not found: ${p}`;
       if (fs.statSync(full).isDirectory()) return `ERROR: ${p} is a directory, use list_dir`;
       const content = fs.readFileSync(full, 'utf8');
       markAgentRead(root, p);
-      const numbered = content.split('\n').map((l, i) => `${i + 1}\t${l}`).join('\n');
-      return truncate(numbered);
+      const numbered = clampFileText(content)
+        .split('\n')
+        .map((l, i) => `${i + 1}\t${l}`)
+        .join('\n');
+      return truncate(numbered, LIMITS.read);
     },
   },
 
@@ -213,7 +260,7 @@ const tools = {
           `grep -rn --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.cortex -- ${JSON.stringify(pattern)} ${JSON.stringify(dir)}`,
           { encoding: 'utf8', maxBuffer: 1024 * 1024 * 10 }
         );
-        return truncate(out || '(no matches)');
+        return truncate(out || '(no matches)', LIMITS.search);
       } catch (err) {
         if (err.status === 1) return '(no matches)';
         return `ERROR: ${err.message}`;
@@ -237,7 +284,8 @@ const tools = {
           if (res) {
             const failed = res.exitCode !== undefined && res.exitCode !== 0;
             return truncate(
-              `${failed ? `EXIT CODE: ${res.exitCode}\n` : ''}${res.output || '(command produced no output)'}`
+              `${failed ? `EXIT CODE: ${res.exitCode}\n` : ''}${res.output || '(command produced no output)'}`,
+              LIMITS.command
             );
           }
         } catch {
@@ -249,10 +297,11 @@ const tools = {
         : { command, sandboxed: false };
       try {
         const out = execSync(toRun, { encoding: 'utf8', cwd: root, maxBuffer: 1024 * 1024 * 10, timeout: 60_000 });
-        return truncate(`${sandboxed ? '[sandboxed]\n' : ''}${out || '(command produced no output)'}`);
+        return truncate(`${sandboxed ? '[sandboxed]\n' : ''}${out || '(command produced no output)'}`, LIMITS.command);
       } catch (err) {
         return truncate(
-          `${sandboxed ? '[sandboxed]\n' : ''}EXIT CODE: ${err.status}\nSTDOUT:\n${err.stdout || ''}\nSTDERR:\n${err.stderr || err.message}`
+          `${sandboxed ? '[sandboxed]\n' : ''}EXIT CODE: ${err.status}\nSTDOUT:\n${err.stdout || ''}\nSTDERR:\n${err.stderr || err.message}`,
+          LIMITS.command
         );
       }
     },
@@ -303,7 +352,7 @@ const tools = {
       if (!entry) return `ERROR: no background process with id ${id}`;
       const out = entry.output.join('');
       const status = entry.exitCode === null ? 'still running' : `exited with code ${entry.exitCode}`;
-      return truncate(`status: ${status}\n\n${out || '(no output yet)'}`);
+      return truncate(`status: ${status}\n\n${out || '(no output yet)'}`, LIMITS.command);
     },
   },
 
@@ -643,7 +692,7 @@ const tools = {
           `grep -rnE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.cortex -- ${JSON.stringify(pattern)} ${JSON.stringify(dir)}`,
           { encoding: 'utf8', maxBuffer: 1024 * 1024 * 10 }
         );
-        return truncate(out || `(no definition found for "${name}")`);
+        return truncate(out || `(no definition found for "${name}")`, LIMITS.search);
       } catch (err) {
         if (err.status === 1) return `(no definition found for "${name}")`;
         return `ERROR: ${err.message}`;
@@ -667,7 +716,7 @@ const tools = {
           { encoding: 'utf8', maxBuffer: 1024 * 1024 * 10 }
         );
         const lines = (out || '').trim().split('\n').filter(Boolean);
-        return truncate(lines.length ? `${lines.length} reference(s):\n${lines.join('\n')}` : `(no references found for "${name}")`);
+        return truncate(lines.length ? `${lines.length} reference(s):\n${lines.join('\n')}` : `(no references found for "${name}")`, LIMITS.search);
       } catch (err) {
         if (err.status === 1) return `(no references found for "${name}")`;
         return `ERROR: ${err.message}`;

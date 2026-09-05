@@ -607,3 +607,14 @@ body {
 }
 .checkpoint-marker button:hover:not(:disabled) { color: var(--cortex-accent); border-color: var(--cortex-accent); }
 .checkpoint-marker button:disabled { opacity: 0.5; cursor: default; }
+
+.danger-warning {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: var(--cortex-radius-sm);
+  background: var(--vscode-inputValidation-errorBackground);
+  border: 1px solid var(--vscode-inputValidation-errorBorder, transparent);
+  color: var(--vscode-errorForeground);
+  font-size: 12px;
+  font-weight: 500;
+}

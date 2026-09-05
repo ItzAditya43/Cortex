@@ -13,6 +13,7 @@ const { buildContextMessages, DEFAULT_BUDGET_TOKENS } = require('./contextManage
 const { verifySyntax } = require('./verify.cjs');
 const { pickModel } = require('./router.cjs');
 const { getStaleWarning } = require('./fileTracker.cjs');
+const { classifyError } = require('./errorClassification.cjs');
 const lsp = require('./lsp.cjs');
 
 // Pull a TOOL_CALL: {...} instruction out of a model response.
@@ -130,6 +131,25 @@ function parseToolCalls(text) {
   return calls;
 }
 
+// Emergency in-place compaction for a context overflow mid-turn. Keeps the
+// task (the first user message) and the most recent exchanges, replacing the
+// middle with a marker — the same shape the context manager already assumes,
+// so nothing downstream has to know this happened.
+function compactHistoryInPlace(history) {
+  if (history.length <= 4) return 0;
+  const keepTail = 4;
+  const first = history[0];
+  const tail = history.slice(-keepTail);
+  const droppedCount = history.length - keepTail - 1;
+  if (droppedCount <= 0) return 0;
+  history.length = 0;
+  history.push(first, {
+    role: 'user',
+    content: `TOOL_RESULT: SYSTEM NOTE — ${droppedCount} earlier step(s) were dropped because the conversation exceeded the model's context window. The original request above still stands. Re-read any file you need rather than relying on memory of it.`,
+  }, ...tail);
+  return droppedCount;
+}
+
 /**
  * @param {object} opts
  * @param {Array} opts.history           mutable array of {role, content} messages (mutated in place)
@@ -177,6 +197,7 @@ async function runTurn(opts) {
     signal,
     onToken,
     onUsage,
+    onRecovery,
     onToolCall,
     requestApproval,
     onToolResult,
@@ -190,6 +211,8 @@ async function runTurn(opts) {
   let codeFenceNudged = false;
   let testRan = false;
   let consecutiveFailures = 0;
+  let contextRecoveries = 0;
+  let rateLimitBackoffs = 0;
   const editFailuresByPath = new Map(); // path -> consecutive edit_file misses, drives the whole-file fallback
   const callSignatures = new Map(); // "tool(args)" -> times seen, for loop detection
 
@@ -216,8 +239,31 @@ async function runTurn(opts) {
       // (a stalled model, a dropped connection) must be reported, or the
       // turn just ends with no output and no explanation.
       if (err.name === 'AbortError' && signal?.aborted) return;
-      onLog?.(`step ${steps}: error — ${err.message}`);
-      onError(err.message);
+
+      const failure = classifyError(err);
+      onLog?.(`step ${steps}: ${failure.kind} error — ${err.message}`);
+
+      // Some failures the loop can actually fix rather than hand to the user.
+      if (failure.kind === 'context' && contextRecoveries < 1) {
+        contextRecoveries++;
+        onLog?.(`step ${steps}: context overflow — compacting history and retrying`);
+        onRecovery?.('context', 'The conversation outgrew the context window — summarizing it and continuing.');
+        const dropped = compactHistoryInPlace(history);
+        if (dropped > 0) {
+          steps--; // the failed call shouldn't consume a step
+          continue;
+        }
+      }
+      if (failure.retryable && failure.kind === 'rate-limit' && rateLimitBackoffs < 2) {
+        rateLimitBackoffs++;
+        const waitMs = 2000 * rateLimitBackoffs;
+        onRecovery?.('rate-limit', `Rate limited — waiting ${waitMs / 1000}s before retrying.`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        steps--;
+        continue;
+      }
+
+      onError(failure.advice ? `${err.message}\n\n${failure.advice}` : err.message);
       return;
     }
 
