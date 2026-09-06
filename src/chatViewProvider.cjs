@@ -222,6 +222,10 @@ class ChatViewProvider {
         this.post({ type: 'config', ...this.cfg() });
         this.post({ type: 'mode', mode: this.mode });
         this.post({ type: 'autoApproveTools', tools: MUTATING_TOOLS, enabled: this.autoApproveTools });
+        // The webview restarts on reload with a fresh, idle UI; the provider
+        // may not be idle. Without this the two disagree and the panel shows
+        // Stop with nothing running (or Send while a turn is live).
+        this.post({ type: 'busy', value: this.busy });
         {
           const profilesCfg = vscode.workspace.getConfiguration('cortex').get('profiles') || {};
           this.post({ type: 'profiles', names: Object.keys(profilesCfg), active: this.activeProfile });
@@ -236,6 +240,12 @@ class ChatViewProvider {
         break;
       case 'stop':
         this.abortController?.abort();
+        // Hard recovery: if the flag is set but nothing is actually running
+        // (a turn that threw during setup), aborting alone would leave the
+        // UI dead. Stop always returns the panel to a usable state.
+        this.busy = false;
+        this.abortController = null;
+        this.post({ type: 'busy', value: false });
         break;
       case 'approve':
         this.resolveApproval(msg.id, msg.approved);
@@ -584,13 +594,40 @@ class ChatViewProvider {
       this.post({ type: 'banner', text: 'Open a folder/workspace to start using Cortex.' });
       return;
     }
-    if (this.busy) return;
+    if (this.busy) {
+      // Silently dropping the message is what made a stuck busy flag look
+      // like a dead extension: the user types, nothing happens, no reason
+      // given. Say so, and offer the way out.
+      this.post({
+        type: 'error',
+        text: 'Cortex is still working on the previous message. Press Stop to cancel it, then try again.',
+      });
+      return;
+    }
     this.post({ type: 'userMessage', text, image });
     if (await this.handleSlashCommand(text)) return;
 
     this.busy = true;
     this.abortController = new AbortController();
     this.post({ type: 'busy', value: true });
+
+    try {
+      await this.runTurnForMessage(text, image, root);
+    } catch (err) {
+      // Anything that escapes turn setup (config, memory, audit, editor
+      // access) used to leave busy stuck true with no message at all.
+      logger.log(`turn failed before it started: ${err.stack || err.message}`);
+      this.post({ type: 'error', text: `Could not start the turn: ${err.message}` });
+    } finally {
+      this.busy = false;
+      this.abortController = null;
+      this.post({ type: 'busy', value: false });
+    }
+  }
+
+  // The body of a turn. Split out so onSend's finally always runs, whatever
+  // happens in here.
+  async runTurnForMessage(text, image, root) {
 
     // Ollama's /api/chat accepts an `images` field (base64, no data: prefix)
     // on a message for vision-capable models (llava, qwen2.5-vl, etc.) —
@@ -780,9 +817,6 @@ class ChatViewProvider {
       }
       saveHistory(root, this.sessionId, this.history);
       touchSession(root, this.sessionId, this.history);
-      this.busy = false;
-      this.abortController = null;
-      this.post({ type: 'busy', value: false });
     }
   }
 
