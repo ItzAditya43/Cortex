@@ -396,6 +396,11 @@
           "type": "boolean",
           "default": true,
           "description": "Run shell commands in VS Code's visible integrated terminal (so you can watch them) instead of a hidden child process. Requires shell integration; falls back automatically when unavailable, and is bypassed for sandboxed commands."
+        },
+        "cortex.animateEdits": {
+          "type": "boolean",
+          "default": true,
+          "description": "Play each file edit as a top-down sweep in the diff view, slowing through changed lines, so you can watch the change land instead of it appearing all at once. Purely visual \u2014 the animation runs over virtual documents and never touches the file on disk."
         }
       }
     },

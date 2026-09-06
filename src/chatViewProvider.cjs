@@ -24,6 +24,7 @@ const { saveSnapshot, loadSnapshots, deleteSnapshot, clearSession, pruneOldSessi
 const { clearTasks } = require('./taskList.cjs');
 const { markAgentWrite, getStaleWarning } = require('./fileTracker.cjs');
 const audit = require('./auditLog.cjs');
+const { buildEditAnimation } = require('./editAnimation.cjs');
 const logger = require('./logger.cjs');
 
 const MUTATING_TOOLS = Object.entries(tools)
@@ -436,17 +437,39 @@ class ChatViewProvider {
   // chat input (preserveFocus: true) so a long agent run doesn't spam tabs
   // or yank the cursor away every step.
   async showDiffLive(snapshot, callId) {
-    this.diffProvider.store(callId, snapshot);
-    const leftUri = vscode.Uri.parse(`cortex-diff:${callId}/before/${encodeURIComponent(snapshot.path)}`);
-    const rightUri = vscode.Uri.parse(`cortex-diff:${callId}/after/${encodeURIComponent(snapshot.path)}`);
+    // Open showing the file as it was, then sweep to the new content, so the
+    // edit is something you watch rather than a result that blinks into
+    // existence. Both sides are virtual documents; the real file is
+    // untouched by the animation.
+    const animate = vscode.workspace.getConfiguration('cortex').get('animateEdits') !== false;
+    this.diffProvider.store(callId, animate ? { ...snapshot, after: snapshot.before } : snapshot);
+
+    const leftUri = this.diffProvider.uriFor(callId, 'before', snapshot.path);
+    const rightUri = this.diffProvider.uriFor(callId, 'after', snapshot.path);
     try {
       await vscode.commands.executeCommand('vscode.diff', leftUri, rightUri, `${snapshot.path} (Cortex edit)`, {
         preview: true,
         preserveFocus: true,
       });
+      if (animate) {
+        // Deliberately not awaited: the turn continues while the sweep plays,
+        // so the animation never slows the agent down.
+        this.diffProvider.animate(callId, snapshot, {
+          onFrame: (frame) => this.revealLine(rightUri, frame.activeLine),
+        });
+      }
     } catch {
       // best-effort — never let a display glitch break the agent turn
     }
+  }
+
+  // Keeps the sweep line in view, the way a person scrolling as they edit
+  // would. Only acts on the diff editor itself, never the user's own tabs.
+  revealLine(uri, line) {
+    const editor = vscode.window.visibleTextEditors.find((e) => e.document.uri.toString() === uri.toString());
+    if (!editor) return;
+    const range = new vscode.Range(line, 0, line, 0);
+    editor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
   }
 
   async revertChange(callId) {
@@ -916,6 +939,7 @@ class DiffContentProvider {
     this.store_ = new Map();
     this._onDidChange = new vscode.EventEmitter();
     this.onDidChange = this._onDidChange.event;
+    this.animating_ = new Set();
   }
 
   store(id, entry) {
@@ -924,6 +948,46 @@ class DiffContentProvider {
 
   get(id) {
     return this.store_.get(id);
+  }
+
+  uriFor(id, side, filePath) {
+    return vscode.Uri.parse(`cortex-diff:${id}/${side}/${encodeURIComponent(filePath)}`);
+  }
+
+  /** Swaps in new right-hand content and tells VS Code to re-render the diff. */
+  setRight(id, filePath, content) {
+    const entry = this.store_.get(id);
+    if (!entry) return;
+    this.store_.set(id, { ...entry, after: content });
+    // Without firing this, the virtual document is only ever read once and
+    // the diff never updates — which is why nothing appeared to happen.
+    this._onDidChange.fire(this.uriFor(id, 'after', filePath));
+  }
+
+  /**
+   * Plays the edit as a top-down sweep over the virtual document, so the
+   * change is watched rather than just appearing. The file on disk is never
+   * touched by this — the write already happened, or happens after.
+   */
+  async animate(id, snapshot, { onFrame } = {}) {
+    if (this.animating_.has(id)) return;
+    this.animating_.add(id);
+    try {
+      const { frames } = buildEditAnimation(snapshot.before || '', snapshot.after || '');
+      if (frames.length <= 1) {
+        this.setRight(id, snapshot.path, snapshot.after || '');
+        return;
+      }
+      for (const frame of frames) {
+        if (!this.store_.has(id)) return; // the tab was closed mid-sweep
+        this.setRight(id, snapshot.path, frame.content);
+        onFrame?.(frame);
+        if (frame.delayMs > 0) await new Promise((r) => setTimeout(r, frame.delayMs));
+      }
+      this.setRight(id, snapshot.path, snapshot.after || '');
+    } finally {
+      this.animating_.delete(id);
+    }
   }
 
   provideTextDocumentContent(uri) {
