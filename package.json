@@ -451,7 +451,9 @@
     "publish": "@vscode/vsce publish --no-dependencies",
     "test": "node --test test/**/*.test.cjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "eval": "node eval/run.cjs"
+    "eval": "node eval/run.cjs",
+    "reinstall": "@vscode/vsce package --no-dependencies --out /tmp/cortex.vsix && code --install-extension /tmp/cortex.vsix --force",
+    "test:watch": "node --test --watch test/"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
