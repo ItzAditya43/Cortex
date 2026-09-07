@@ -449,12 +449,13 @@
   "scripts": {
     "package": "@vscode/vsce package --no-dependencies",
     "publish": "@vscode/vsce publish --no-dependencies",
-    "test": "node --test test/**/*.test.cjs",
+    "test": "node --test test/*.test.cjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "eval": "node eval/run.cjs",
     "reinstall": "@vscode/vsce package --no-dependencies --out /tmp/cortex.vsix && code --install-extension /tmp/cortex.vsix --force",
     "test:watch": "node --test --watch test/",
-    "test:integration": "xvfb-run -a node test/integration/runTest.cjs"
+    "test:integration": "env -u ELECTRON_RUN_AS_NODE xvfb-run -a node test/integration/runTest.cjs",
+    "test:all": "npm test && npm run test:integration"
   },
   "devDependencies": {
     "@types/node": "^20.19.43",
