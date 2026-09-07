@@ -5,3 +5,4 @@ node_modules/
 *.vsix
 out/
 .vscode/settings.json
+.vscode-test/

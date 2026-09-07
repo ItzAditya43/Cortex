@@ -11,3 +11,5 @@ test/**
 tsconfig.json
 eval/**
 SMOKE-TEST.md
+test/**
+.vscode-test/**
