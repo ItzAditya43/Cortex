@@ -1,0 +1,286 @@
+{
+  "at": "2026-09-07T18:43:03.663Z",
+  "host": "http://localhost:11434",
+  "models": {
+    "gemma4:31b-cloud": {
+      "passed": 12,
+      "always": 11,
+      "flaky": 1,
+      "total": 12,
+      "infra": 0,
+      "scored": 12,
+      "repeat": 3,
+      "rate": 1,
+      "results": [
+        {
+          "task": "create-file",
+          "tags": [
+            "create"
+          ],
+          "passed": true,
+          "reason": null,
+          "error": null,
+          "steps": 1,
+          "tools": [
+            "write_file"
+          ],
+          "ms": 2363,
+          "finalText": "I have created the `greet.js` file with the `greet` function as requested.",
+          "infra": false,
+          "attempts": 3,
+          "passes": 3,
+          "scoredAttempts": 3,
+          "always": true,
+          "flaky": false
+        },
+        {
+          "task": "edit-single-line",
+          "tags": [
+            "edit"
+          ],
+          "passed": true,
+          "reason": null,
+          "error": null,
+          "steps": 2,
+          "tools": [
+            "read_file",
+            "edit_file"
+          ],
+          "ms": 2491,
+          "finalText": "I have updated the port from 3000 to 8080 in `config.js`.",
+          "infra": false,
+          "attempts": 3,
+          "passes": 3,
+          "scoredAttempts": 3,
+          "always": true,
+          "flaky": false
+        },
+        {
+          "task": "edit-preserve-indentation",
+          "tags": [
+            "edit"
+          ],
+          "passed": true,
+          "reason": null,
+          "error": null,
+          "steps": 2,
+          "tools": [
+            "read_file",
+            "edit_file"
+          ],
+          "ms": 2425,
+          "finalText": "I have updated `deep.js` so that the `run()` method returns `42` instead of `1`.",
+          "infra": false,
+          "attempts": 3,
+          "passes": 3,
+          "scoredAttempts": 3,
+          "always": true,
+          "flaky": false
+        },
+        {
+          "task": "add-function-to-existing",
+          "tags": [
+            "edit"
+          ],
+          "passed": true,
+          "reason": null,
+          "error": null,
+          "steps": 2,
+          "tools": [
+            "read_file",
+            "write_file"
+          ],
+          "ms": 2253,
+          "finalText": "I have added the `subtract(a, b)` function to `math.js` and updated the exports to include it alongside `add`.",
+          "infra": false,
+          "attempts": 3,
+          "passes": 3,
+          "scoredAttempts": 3,
+          "always": true,
+          "flaky": false
+        },
+        {
+          "task": "multi-file-edit",
+          "tags": [
+            "edit",
+            "multi"
+          ],
+          "passed": true,
+          "reason": null,
+          "error": null,
+          "steps": 2,
+          "tools": [
+            "read_file",
+            "multi_edit"
+          ],
+          "ms": 5029,
+          "finalText": "Updated `VERSION` to \"2.0.0\" in both `a.js` and `b.js`.",
+          "infra": false,
+          "attempts": 3,
+          "passes": 3,
+          "scoredAttempts": 3,
+          "always": true,
+          "flaky": false
+        },
+        {
+          "task": "find-then-fix",
+          "tags": [
+            "search",
+            "edit"
+          ],
+          "passed": true,
+          "reason": null,
+          "error": null,
+          "steps": 3,
+          "tools": [
+            "search_code",
+            "read_file",
+            "edit_file"
+          ],
+          "ms": 4153,
+          "finalText": "I have updated the `slugify` function in `src/util.js` to replace spaces with hyphens.",
+          "infra": false,
+          "attempts": 3,
+          "passes": 3,
+          "scoredAttempts": 3,
+          "always": true,
+          "flaky": false
+        },
+        {
+          "task": "fix-syntax-error",
+          "tags": [
+            "fix"
+          ],
+          "passed": true,
+          "reason": null,
+          "error": null,
+          "steps": 2,
+          "tools": [
+            "read_file",
+            "edit_file"
+          ],
+          "ms": 9026,
+          "finalText": "I have fixed the syntax error in `broken.js` by adding the missing closing brace for the `hello` function.",
+          "infra": false,
+          "attempts": 3,
+          "passes": 3,
+          "scoredAttempts": 3,
+          "always": true,
+          "flaky": false
+        },
+        {
+          "task": "no-op-when-already-correct",
+          "tags": [
+            "restraint"
+          ],
+          "passed": true,
+          "reason": null,
+          "error": null,
+          "steps": 1,
+          "tools": [
+            "read_file"
+          ],
+          "ms": 1546,
+          "finalText": "`fine.js` already sets `PORT` to 8080.",
+          "infra": false,
+          "attempts": 3,
+          "passes": 3,
+          "scoredAttempts": 3,
+          "always": true,
+          "flaky": false
+        },
+        {
+          "task": "delete-file",
+          "tags": [
+            "delete"
+          ],
+          "passed": true,
+          "reason": null,
+          "error": null,
+          "steps": 2,
+          "tools": [
+            "list_dir",
+            "delete_file"
+          ],
+          "ms": 3518,
+          "finalText": "I have deleted the file `remove-me.js` and left `keep.js` untouched.",
+          "infra": false,
+          "attempts": 3,
+          "passes": 3,
+          "scoredAttempts": 3,
+          "always": true,
+          "flaky": false
+        },
+        {
+          "task": "rename-across-references",
+          "tags": [
+            "refactor",
+            "multi"
+          ],
+          "passed": true,
+          "reason": "oldName still referenced somewhere",
+          "error": null,
+          "steps": 2,
+          "tools": [
+            "search_code",
+            "multi_edit"
+          ],
+          "ms": 2440,
+          "finalText": "I have renamed the function `oldName` to `newName` in both `app.js` and `lib.js`.",
+          "infra": false,
+          "attempts": 3,
+          "passes": 2,
+          "scoredAttempts": 3,
+          "always": false,
+          "flaky": true
+        },
+        {
+          "task": "read-before-answer",
+          "tags": [
+            "search"
+          ],
+          "passed": true,
+          "reason": null,
+          "error": null,
+          "steps": 3,
+          "tools": [
+            "list_dir",
+            "read_file",
+            "write_file"
+          ],
+          "ms": 3018,
+          "finalText": "I have read the secret word from `data/secret.txt` and written it to `answer.txt`.",
+          "infra": false,
+          "attempts": 3,
+          "passes": 3,
+          "scoredAttempts": 3,
+          "always": true,
+          "flaky": false
+        },
+        {
+          "task": "append-not-overwrite",
+          "tags": [
+            "edit",
+            "restraint"
+          ],
+          "passed": true,
+          "reason": null,
+          "error": null,
+          "steps": 2,
+          "tools": [
+            "read_file",
+            "edit_file"
+          ],
+          "ms": 6713,
+          "finalText": "I have added the third bullet point to `notes.md`.",
+          "infra": false,
+          "attempts": 3,
+          "passes": 3,
+          "scoredAttempts": 3,
+          "always": true,
+          "flaky": false
+        }
+      ]
+    }
+  }
+}

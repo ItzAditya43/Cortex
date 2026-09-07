@@ -252,12 +252,18 @@ async function main() {
       );
       const prev = baseline?.models?.[model];
       if (prev) {
-        const delta = passed - prev.passed;
+        // Only compare tasks this run actually executed. Comparing a filtered
+        // run (--only / --tags) against a full baseline reports the tasks that
+        // were never run as regressions — "-11" for a single passing task.
+        const ranTasks = new Set(results.map((r) => r.task));
+        const prevComparable = prev.results.filter((p) => ranTasks.has(p.task));
+        const prevPassed = prevComparable.filter((p) => p.passed).length;
+        const delta = passed - prevPassed;
         const regressed = results.filter(
-          (r) => !r.passed && !r.infra && prev.results.find((p) => p.task === r.task)?.passed
+          (r) => !r.passed && !r.infra && prevComparable.find((p) => p.task === r.task)?.passed
         );
         console.log(
-          `  vs baseline: ${delta >= 0 ? '+' : ''}${delta}` +
+          `  vs baseline (${prevComparable.length} comparable task(s)): ${delta >= 0 ? '+' : ''}${delta}` +
             (regressed.length ? `  \x1b[31mREGRESSED: ${regressed.map((r) => r.task).join(', ')}\x1b[0m` : '')
         );
       }
@@ -272,7 +278,13 @@ async function main() {
 
   // Non-zero exit on a regression makes this usable as a CI gate.
   const regressedAnywhere = baseline
-    ? Object.entries(report.models).some(([m, r]) => baseline.models[m] && r.passed < baseline.models[m].passed)
+    ? Object.entries(report.models).some(([m, r]) => {
+        const prev = baseline.models[m];
+        if (!prev) return false;
+        const ran = new Set(r.results.map((x) => x.task));
+        const prevPassed = prev.results.filter((p) => ran.has(p.task) && p.passed).length;
+        return r.passed < prevPassed;
+      })
     : false;
   process.exit(regressedAnywhere ? 1 : 0);
 }

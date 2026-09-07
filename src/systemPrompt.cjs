@@ -81,7 +81,7 @@ Available tools:
 ${toolListForPrompt()}
 
 Guidelines:
-- Always read_file before edit_file, so old_str matches the file exactly (including whitespace).
+- Always read_file before edit_file or multi_edit, so every old_str matches the file exactly (including whitespace). This applies to EVERY file in a multi_edit — searching for a name is not the same as seeing the line you are about to replace, and a guessed old_str is the most common way an edit fails.
 - Prefer edit_file for small/targeted changes; use write_file for new files or full rewrites.
 - Use run_command to run tests, linters, or build steps to verify your work when relevant.
 - Use search_code to find where things are defined/used before making changes in an unfamiliar codebase.
