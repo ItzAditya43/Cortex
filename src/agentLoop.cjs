@@ -150,6 +150,25 @@ function compactHistoryInPlace(history) {
   return droppedCount;
 }
 
+// Does the reply claim a file was or will be changed? Only then is a code
+// fence evidence of an edit that never happened. Explanations, examples and
+// review comments all contain fences too, and must be left alone.
+function claimsAnEdit(text) {
+  return /\b(?:I(?:'ve| have| will|'ll)?\s+(?:created|added|updated|written|wrote|modified|changed|implemented|fixed|replaced)|here(?:'s| is)\s+the\s+(?:updated|new|modified|corrected|fixed)\b|(?:updated|new|modified)\s+(?:file|version|contents)\s*:)/i.test(
+    text
+  );
+}
+
+// A reply that is only commentary about the nudge itself, rather than a real
+// answer — the model defending itself instead of helping.
+function looksLikeNudgeArtifact(text) {
+  const t = text.trim();
+  if (t.length > 600) return false; // a substantial answer is a real answer
+  return /\b(?:did not intend|didn't intend|was (?:only|just) (?:explaining|illustrating|providing)|no (?:file )?changes? (?:were|was) (?:made|intended)|I was providing)/i.test(
+    t
+  );
+}
+
 /**
  * @param {object} opts
  * @param {Array} opts.history           mutable array of {role, content} messages (mutated in place)
@@ -209,6 +228,7 @@ async function runTurn(opts) {
   let steps = 0;
   let usedMutatingTool = false;
   let codeFenceNudged = false;
+  let unperformedEditReply = null;
   let testRan = false;
   let consecutiveFailures = 0;
   let contextRecoveries = 0;
@@ -270,19 +290,35 @@ async function runTurn(opts) {
     const parsed = parseToolCall(reply);
 
     if (!parsed.attempted) {
-      // Small models frequently "explain" a change with a fenced code block
-      // instead of actually calling write_file/edit_file — nothing gets
-      // saved to disk even though the response looks like it did the work.
-      // Give one nudge back before accepting it as a genuine final answer.
-      if (/```/.test(reply) && !codeFenceNudged) {
+      // Models sometimes "explain" a change with a fenced code block instead
+      // of calling write_file/edit_file, so nothing reaches disk even though
+      // the reply reads like the work was done. Worth one nudge — but ONLY
+      // when the reply actually claims an edit.
+      //
+      // Nudging on any code fence punishes the most common request there is:
+      // "explain this", "show me an example", "what's wrong here" all answer
+      // with a fence and no edit intended. Doing so replaced a correct
+      // explanation with a defensive "I did not intend to change any files",
+      // i.e. the guard destroyed the very answer the user asked for.
+      if (/```/.test(reply) && !codeFenceNudged && claimsAnEdit(reply) && !usedMutatingTool) {
         codeFenceNudged = true;
+        unperformedEditReply = reply; // keep it: the retry may be worse than this
         history.push({ role: 'assistant', content: reply });
         history.push({
           role: 'user',
           content:
-            'TOOL_RESULT: You printed a code block instead of calling a tool, so nothing was saved. If you intended to change a file, respond with TOOL_CALL: {"name": "write_file"|"edit_file", "arguments": {...}} instead. If you were just showing an example/explanation with no file change intended, say so in plain text without any ``` fences.',
+            'TOOL_RESULT: You described a file change but did not call a tool, so nothing was written. If you meant to change a file, respond with a single TOOL_CALL: {"name": "write_file"|"edit_file", "arguments": {...}} line. If you were only explaining or illustrating, repeat your explanation as your final answer — it was correct, it simply did not modify anything.',
         });
         continue;
+      }
+
+      // If the nudge produced nothing better — no tool call, and a reply that
+      // is now just meta-commentary about the nudge — the original answer was
+      // the real one. Show that instead of the apology it turned into.
+      if (unperformedEditReply && looksLikeNudgeArtifact(reply)) {
+        history.push({ role: 'assistant', content: unperformedEditReply });
+        onFinal(unperformedEditReply.trim(), steps);
+        return;
       }
       // Before accepting a final answer, if this turn actually changed
       // files, give the project's own test command one chance to catch
