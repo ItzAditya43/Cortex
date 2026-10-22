@@ -25,22 +25,73 @@ function sessionDir(root, sessionId) {
 }
 
 /**
+ * Undoes one recorded change. Writing `before` back is only right for a
+ * plain edit: a file the agent created has to be removed (not left behind
+ * empty), a rename has to be moved back, and a multi_edit snapshot covers
+ * several files under a summary label that is not a path at all.
+ *
+ * @param {string} root
+ * @param {{path: string, before: string, created?: boolean, renameFrom?: string, renameTo?: string,
+ *          files?: Array<{path: string, before: string, created?: boolean}>}} snap
+ * @returns {string[]} workspace-relative paths restored
+ */
+function restoreSnapshot(root, snap) {
+  const { safePath } = require('./tools.cjs');
+  const { markAgentWrite } = require('./fileTracker.cjs');
+  /** @param {{path: string, before: string, created?: boolean}} f */
+  const restoreOne = ({ path: rel, before, created }) => {
+    const full = safePath(root, rel);
+    if (created) {
+      if (fs.existsSync(full)) fs.unlinkSync(full);
+    } else {
+      fs.mkdirSync(path.dirname(full), { recursive: true });
+      fs.writeFileSync(full, before ?? '');
+    }
+    markAgentWrite(root, rel);
+    return rel;
+  };
+  if (Array.isArray(snap.files)) return snap.files.map(restoreOne);
+  if (snap.renameFrom && snap.renameTo) {
+    const from = safePath(root, snap.renameFrom);
+    const to = safePath(root, snap.renameTo);
+    if (fs.existsSync(to)) {
+      fs.mkdirSync(path.dirname(from), { recursive: true });
+      fs.renameSync(to, from);
+    }
+    return [snap.renameFrom];
+  }
+  return [restoreOne(snap)];
+}
+
+/**
  * Persists one file-change snapshot so it can be reverted after a reload.
  * @param {string} root
  * @param {string} sessionId
  * @param {string} callId       the tool call this snapshot belongs to
- * @param {{path: string, before: string, after?: string}} snapshot
+ * @param {{path: string, before: string, after?: string, created?: boolean, renameFrom?: string, renameTo?: string,
+ *          files?: Array<{path: string, before: string, created?: boolean}>}} snapshot
  * @param {string} [turnId]     groups snapshots made during the same turn
  */
 function saveSnapshot(root, sessionId, callId, snapshot, turnId) {
   if (!root || !snapshot || snapshot.before === undefined) return;
-  const size = Buffer.byteLength(snapshot.before || '', 'utf8');
-  if (size > MAX_SNAPSHOT_BYTES) return;
+  const befores = snapshot.files ? snapshot.files.map((f) => f.before || '').join('') : snapshot.before || '';
+  if (Buffer.byteLength(befores, 'utf8') > MAX_SNAPSHOT_BYTES) return;
   try {
     const file = path.join(sessionDir(root, sessionId), `${callId}.json`);
+    const { path: p, before, created, renameFrom, renameTo, files } = snapshot;
     fs.writeFileSync(
       file,
-      JSON.stringify({ callId, turnId, path: snapshot.path, before: snapshot.before, at: Date.now() })
+      JSON.stringify({
+        callId,
+        turnId,
+        path: p,
+        before,
+        created,
+        renameFrom,
+        renameTo,
+        files: files?.map((f) => ({ path: f.path, before: f.before, created: f.created })),
+        at: Date.now(),
+      })
     );
   } catch {
     // Persistence is a convenience layer — never break a turn over it.
@@ -48,7 +99,8 @@ function saveSnapshot(root, sessionId, callId, snapshot, turnId) {
 }
 
 /**
- * @returns {Array<{callId: string, turnId?: string, path: string, before: string, at: number}>}
+ * @returns {Array<{callId: string, turnId?: string, path: string, before: string, at: number, created?: boolean,
+ *   renameFrom?: string, renameTo?: string, files?: Array<{path: string, before: string, created?: boolean}>}>}
  *   snapshots for a session, oldest first
  */
 function loadSnapshots(root, sessionId) {
@@ -102,4 +154,4 @@ function pruneOldSessions(root, keep = MAX_SESSIONS) {
   }
 }
 
-module.exports = { saveSnapshot, loadSnapshots, deleteSnapshot, clearSession, pruneOldSessions };
+module.exports = { saveSnapshot, loadSnapshots, deleteSnapshot, clearSession, pruneOldSessions, restoreSnapshot };

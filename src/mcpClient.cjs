@@ -8,7 +8,7 @@
 const { spawn } = require('child_process');
 
 /**
- * @param {{command: string, args?: string[], env?: object}} config
+ * @param {{command?: string, args?: string[], env?: object, name?: string}} config
  * @returns {Promise<{tools: Array, callTool: (name: string, args: object) => Promise<string>, close: () => void}>}
  */
 function connectMcpServer(config) {
@@ -130,7 +130,7 @@ function connectMcpHttpServer(config) {
     const returnedSession = res.headers.get('mcp-session-id');
     if (returnedSession) sessionId = returnedSession;
     if (!res.ok) throw new Error(`MCP HTTP server returned ${res.status}`);
-    const data = await res.json();
+    const data = /** @type {any} */ (await res.json());
     if (data.error) throw new Error(data.error.message || 'MCP error');
     return data.result;
   }

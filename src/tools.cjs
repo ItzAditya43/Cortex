@@ -10,10 +10,10 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync, spawn } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const { appendMemoryNote } = require('./memory.cjs');
 const { indexNote } = require('./semanticMemory.cjs');
-const { wrapCommand } = require('./sandbox.cjs');
+const { wrapCommand, shellQuote: shq } = require('./sandbox.cjs');
 const { markAgentRead, markAgentWrite } = require('./fileTracker.cjs');
 const { saveTasks, taskProgress } = require('./taskList.cjs');
 const lsp = require('./lsp.cjs');
@@ -40,6 +40,104 @@ const LIMITS = {
 // process serves one workspace at a time.
 const backgroundProcs = new Map(); // id -> {proc, output: string[], exitCode: number|null}
 let backgroundIdCounter = 0;
+
+const COMMAND_TIMEOUT_MS = 120_000;
+
+/**
+ * Runs a shell command without blocking the extension host.
+ *
+ * execSync froze all of VS Code for as long as a command ran — the chat
+ * stopped streaming, Stop could not be clicked, other extensions hung. This
+ * is the same contract, asynchronously, and it can be cancelled: a Stop or
+ * timeout kills the whole process group, not just the shell wrapper.
+ *
+ * @param {string} command
+ * @param {{cwd: string, timeoutMs?: number, signal?: AbortSignal, maxBytes?: number}} opts
+ * @returns {Promise<{stdout: string, stderr: string, code: number|null, timedOut: boolean, aborted: boolean}>}
+ */
+function runShell(command, { cwd, timeoutMs = COMMAND_TIMEOUT_MS, signal, maxBytes = 10 * 1024 * 1024 }) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve({ stdout: '', stderr: '', code: null, timedOut: false, aborted: true });
+      return;
+    }
+    const proc = spawn(command, { cwd, shell: true, detached: process.platform !== 'win32' });
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let aborted = false;
+    const kill = () => {
+      try {
+        if (process.platform !== 'win32' && proc.pid) process.kill(-proc.pid, 'SIGKILL');
+        else proc.kill('SIGKILL');
+      } catch {
+        // already gone
+      }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      kill();
+    }, timeoutMs);
+    const onAbort = () => {
+      aborted = true;
+      kill();
+    };
+    signal?.addEventListener('abort', onAbort);
+    proc.stdout.on('data', (d) => {
+      if (stdout.length < maxBytes) stdout += d.toString();
+    });
+    proc.stderr.on('data', (d) => {
+      if (stderr.length < maxBytes) stderr += d.toString();
+    });
+    const finish = (code) => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve({ stdout, stderr, code, timedOut, aborted });
+    };
+    proc.on('error', (err) => {
+      stderr += err.message;
+      finish(null);
+    });
+    proc.on('close', (code) => finish(code));
+  });
+}
+
+const GREP_EXCLUDES = '--exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.cortex';
+
+async function grep(flags, pattern, dir, root, signal) {
+  let res = await runShell(`grep ${flags} ${GREP_EXCLUDES} -- ${shq(pattern)} ${shq(dir)}`, {
+    cwd: root,
+    timeoutMs: 30_000,
+    signal,
+  });
+  // An invalid regex (models write PCRE-isms grep rejects) used to come
+  // back as a bare grep error, and the model retried the identical call
+  // until the loop breaker stopped it. Searching for the text literally is
+  // almost always what was meant.
+  let note = '';
+  if (res.code === 2 && !flags.includes('F') && /unmatched|invalid|trailing backslash|unbalanced/i.test(res.stderr)) {
+    res = await runShell(`grep ${flags.replace('E', '')}F ${GREP_EXCLUDES} -- ${shq(pattern)} ${shq(dir)}`, { cwd: root, timeoutMs: 30_000, signal });
+    note = '(not a valid regex — searched for it as literal text)\n';
+  }
+  if (res.code === 1) return { ok: true, out: '', note };
+  if (res.code !== 0) return { ok: false, out: res.timedOut ? 'search timed out after 30s' : res.stderr.trim() || `grep exited ${res.code}` };
+  // Paths relative to the workspace are shorter and are what every other
+  // tool takes as input.
+  const prefix = root.endsWith(path.sep) ? root : root + path.sep;
+  return { ok: true, out: res.stdout.split(prefix).join(''), note };
+}
+
+// git with an argv, never a shell string, so a path or message can't be
+// interpreted as shell syntax.
+function git(root, args, input) {
+  return execFileSync('git', args, {
+    cwd: root,
+    encoding: 'utf8',
+    input,
+    maxBuffer: 10 * 1024 * 1024,
+    stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+  });
+}
 
 function truncate(s, limit = LIMITS.default) {
   if (typeof s !== 'string') s = String(s);
@@ -131,9 +229,102 @@ function applySnippet(content, oldStr, newStr) {
   return { ok: true, how: hit.how, after: content.slice(0, hit.start) + (newStr ?? '') + content.slice(hit.end) };
 }
 
+const SKIP_DIRS = new Set(['node_modules', '.git', '.cortex', 'dist', 'build', 'out', '.next', '__pycache__', '.venv', 'venv', 'target']);
+
+// Workspace-relative file paths, bounded so a huge repo can't stall a tool.
+function listFiles(root, limit = 5000) {
+  const out = [];
+  const walk = (dir) => {
+    if (out.length >= limit) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (out.length >= limit) return;
+      if (e.isDirectory()) {
+        if (!SKIP_DIRS.has(e.name)) walk(path.join(dir, e.name));
+      } else if (e.isFile()) {
+        out.push(path.relative(root, path.join(dir, e.name)));
+      }
+    }
+  };
+  walk(root);
+  return out;
+}
+
+// For "file not found": the files that probably were meant. A bare
+// not-found sent small models straight to "please check the file exists";
+// showing what is actually there lets them correct the guess themselves.
+function suggestPaths(root, p) {
+  const wanted = String(p || '');
+  const base = path.basename(wanted).toLowerCase();
+  const stem = base.replace(/\.[^.]+$/, '');
+  const dir = path.dirname(wanted);
+  const files = listFiles(root);
+  const scored = [];
+  for (const f of files) {
+    const fb = path.basename(f).toLowerCase();
+    let score = 0;
+    if (fb === base) score += 10;
+    else if (stem && fb.replace(/\.[^.]+$/, '') === stem) score += 6;
+    else if (stem.length >= 3 && (fb.includes(stem) || stem.includes(fb.replace(/\.[^.]+$/, '')))) score += 3;
+    if (dir !== '.' && path.dirname(f) === dir) score += 4;
+    else if (dir !== '.' && f.startsWith(dir + path.sep)) score += 2;
+    if (score > 0) scored.push({ f, score });
+  }
+  scored.sort((a, b) => b.score - a.score || a.f.length - b.f.length);
+  const picks = scored.slice(0, 8).map((x) => x.f);
+  if (picks.length) return `\nDid you mean one of these?\n${picks.map((f) => `  ${f}`).join('\n')}`;
+  const top = files.slice(0, 30);
+  return top.length ? `\nFiles in the workspace${files.length > 30 ? ' (first 30)' : ''}:\n${top.map((f) => `  ${f}`).join('\n')}` : '';
+}
+
+// For an edit_file miss: the region of the file that most resembles the
+// snippet, with line numbers, so the model can copy the real text instead
+// of guessing again.
+function closestRegion(content, oldStr) {
+  const fileLines = content.split(/\r?\n/);
+  const snippetLines = String(oldStr).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (!snippetLines.length || !fileLines.length) return '';
+  const tokens = (s) => new Set(s.toLowerCase().match(/[a-z0-9_$]+/g) || []);
+  const want = snippetLines.map(tokens);
+  let best = { score: 0, at: -1 };
+  for (let i = 0; i < fileLines.length; i++) {
+    let score = 0;
+    for (let k = 0; k < want.length && i + k < fileLines.length; k++) {
+      const have = tokens(fileLines[i + k]);
+      if (!want[k].size) continue;
+      let hit = 0;
+      for (const t of want[k]) if (have.has(t)) hit++;
+      score += hit / want[k].size;
+    }
+    if (score > best.score) best = { score, at: i };
+  }
+  if (best.at === -1 || best.score / want.length < 0.3) return '';
+  const from = Math.max(0, best.at - 2);
+  const to = Math.min(fileLines.length, best.at + snippetLines.length + 2);
+  const shown = fileLines.slice(from, to).map((l, k) => `${from + k + 1}\t${l}`).join('\n');
+  return `\nThe closest text actually in the file (lines ${from + 1}-${to}):\n${shown}`;
+}
+
 const NOT_FOUND_HINT =
   'Re-read the file with read_file and copy the snippet verbatim. If it still fails, use write_file with the complete new file contents instead of retrying edit_file.';
 
+/**
+ * @typedef {object} ToolDef
+ * @property {string} description
+ * @property {boolean} [confirm]
+ * @property {boolean} [readOnly]
+ * @property {'edit'|'command'} [kind]
+ * @property {object} [schema]
+ * @property {(args: any, root: string) => any} [preview]
+ * @property {(args: any, root: string, ctx?: any) => any} run
+ */
+
+/** @type {Record<string, ToolDef>} */
 const tools = {
   read_file: {
     description:
@@ -162,9 +353,11 @@ const tools = {
         );
       }
       const full = safePath(root, p);
-      if (!fs.existsSync(full)) return `ERROR: file not found: ${p}`;
+      if (!fs.existsSync(full)) return `ERROR: file not found: ${p}${suggestPaths(root, p)}`;
       if (fs.statSync(full).isDirectory()) return `ERROR: ${p} is a directory, use list_dir`;
-      const content = fs.readFileSync(full, 'utf8');
+      const buf = fs.readFileSync(full);
+      if (buf.subarray(0, 8000).includes(0)) return `ERROR: ${p} looks like a binary file (${buf.length} bytes) — not shown`;
+      const content = buf.toString('utf8');
       markAgentRead(root, p);
       const numbered = clampFileText(content)
         .split('\n')
@@ -180,8 +373,9 @@ const tools = {
     kind: 'edit',
     preview: ({ path: p, content }, root) => {
       const full = safePath(root, p);
-      const before = fs.existsSync(full) && !fs.statSync(full).isDirectory() ? fs.readFileSync(full, 'utf8') : '';
-      return { path: p, before, after: content ?? '' };
+      const exists = fs.existsSync(full) && !fs.statSync(full).isDirectory();
+      const before = exists ? fs.readFileSync(full, 'utf8') : '';
+      return { path: p, before, after: content ?? '', created: !exists };
     },
     run: ({ path: p, content }, root) => {
       const full = safePath(root, p);
@@ -216,7 +410,7 @@ const tools = {
     },
     run: ({ path: p, old_str, new_str }, root) => {
       const full = safePath(root, p);
-      if (!fs.existsSync(full)) return `ERROR: file not found: ${p}`;
+      if (!fs.existsSync(full)) return `ERROR: file not found: ${p}${suggestPaths(root, p)}`;
       const content = fs.readFileSync(full, 'utf8');
       if (!old_str) return 'ERROR: old_str must not be empty';
       const applied = applySnippet(content, old_str, new_str);
@@ -224,7 +418,7 @@ const tools = {
         if (applied.reason === 'ambiguous') {
           return `ERROR: old_str matches ${applied.count} places in ${p}. Add more surrounding context to make it unique.`;
         }
-        return `ERROR: old_str not found in ${p}. ${NOT_FOUND_HINT}`;
+        return `ERROR: old_str not found in ${p}. ${NOT_FOUND_HINT}${closestRegion(content, old_str)}`;
       }
       fs.writeFileSync(full, applied.after);
       markAgentWrite(root, p);
@@ -238,7 +432,8 @@ const tools = {
     readOnly: true,
     run: ({ path: p }, root) => {
       const full = safePath(root, p || '.');
-      if (!fs.existsSync(full)) return `ERROR: path not found: ${p}`;
+      if (!fs.existsSync(full)) return `ERROR: path not found: ${p}${suggestPaths(root, p)}`;
+      if (!fs.statSync(full).isDirectory()) return `ERROR: ${p} is a file, not a directory — use read_file`;
       const entries = fs.readdirSync(full, { withFileTypes: true });
       const lines = entries
         .filter((e) => !['node_modules', '.git', '.cortex'].includes(e.name))
@@ -249,22 +444,16 @@ const tools = {
   },
 
   search_code: {
-    description: 'Search for a text pattern across files (like grep -rn). Arguments: {"pattern": string, "path": string (optional, default ".")}',
+    description:
+      'Search file contents across the workspace (like grep -rnE: extended regex, e.g. "slugify|slug_ify" or "def \\w+_test"). Returns file:line:text. Arguments: {"pattern": string, "path": string (optional, default ".")}',
     confirm: false,
     readOnly: true,
-    run: ({ pattern, path: p }, root) => {
+    run: async ({ pattern, path: p }, root, ctx) => {
       if (!pattern) return 'ERROR: pattern is required';
-      try {
-        const dir = safePath(root, p || '.');
-        const out = execSync(
-          `grep -rn --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.cortex -- ${JSON.stringify(pattern)} ${JSON.stringify(dir)}`,
-          { encoding: 'utf8', maxBuffer: 1024 * 1024 * 10 }
-        );
-        return truncate(out || '(no matches)', LIMITS.search);
-      } catch (err) {
-        if (err.status === 1) return '(no matches)';
-        return `ERROR: ${err.message}`;
-      }
+      const dir = safePath(root, p || '.');
+      const { ok, out, note } = await grep('-rnIE', pattern, dir, root, ctx?.signal);
+      if (!ok) return `ERROR: ${out}`;
+      return truncate(`${note || ''}${out.trim() ? out : '(no matches)'}`, LIMITS.search);
     },
   },
 
@@ -295,15 +484,20 @@ const tools = {
       const { command: toRun, sandboxed } = ctx?.sandboxMode === 'workspace-write'
         ? wrapCommand(command, root, { allowNetwork: !!ctx.sandboxAllowNetwork })
         : { command, sandboxed: false };
-      try {
-        const out = execSync(toRun, { encoding: 'utf8', cwd: root, maxBuffer: 1024 * 1024 * 10, timeout: 60_000 });
-        return truncate(`${sandboxed ? '[sandboxed]\n' : ''}${out || '(command produced no output)'}`, LIMITS.command);
-      } catch (err) {
+      const res = await runShell(toRun, { cwd: root, signal: ctx?.signal });
+      const tag = sandboxed ? '[sandboxed]\n' : '';
+      if (res.aborted) return `${tag}ERROR: command cancelled by the user`;
+      if (res.timedOut) {
         return truncate(
-          `${sandboxed ? '[sandboxed]\n' : ''}EXIT CODE: ${err.status}\nSTDOUT:\n${err.stdout || ''}\nSTDERR:\n${err.stderr || err.message}`,
+          `${tag}ERROR: command timed out after ${COMMAND_TIMEOUT_MS / 1000}s and was killed. For servers and watchers use run_background instead.\nSTDOUT:\n${res.stdout}\nSTDERR:\n${res.stderr}`,
           LIMITS.command
         );
       }
+      if (res.code === 0) {
+        const out = res.stdout + (res.stderr.trim() ? `\nSTDERR:\n${res.stderr}` : '');
+        return truncate(`${tag}${out.trim() ? out : '(command produced no output)'}`, LIMITS.command);
+      }
+      return truncate(`${tag}EXIT CODE: ${res.code}\nSTDOUT:\n${res.stdout}\nSTDERR:\n${res.stderr}`, LIMITS.command);
     },
   },
 
@@ -428,6 +622,7 @@ const tools = {
       if (!fs.existsSync(full)) return `ERROR: file not found: ${p}`;
       if (fs.statSync(full).isDirectory()) return `ERROR: ${p} is a directory, refusing to delete_file it`;
       fs.unlinkSync(full);
+      markAgentWrite(root, p);
       return `OK: deleted ${p}`;
     },
   },
@@ -438,15 +633,18 @@ const tools = {
     kind: 'edit',
     preview: ({ from, to }, root) => {
       const full = safePath(root, from);
+      safePath(root, to);
       const before = fs.existsSync(full) ? fs.readFileSync(full, 'utf8') : '';
-      return { path: `${from} -> ${to}`, before, after: before };
+      return { path: `${from} -> ${to}`, before, after: before, renameFrom: from, renameTo: to };
     },
     run: ({ from, to }, root) => {
       const fullFrom = safePath(root, from);
       const fullTo = safePath(root, to);
       if (!fs.existsSync(fullFrom)) return `ERROR: file not found: ${from}`;
+      if (fs.existsSync(fullTo)) return `ERROR: ${to} already exists — refusing to overwrite it`;
       fs.mkdirSync(path.dirname(fullTo), { recursive: true });
       fs.renameSync(fullFrom, fullTo);
+      markAgentWrite(root, to);
       return `OK: renamed ${from} -> ${to}`;
     },
   },
@@ -517,26 +715,41 @@ const tools = {
       'Apply several edit_file-style patches (possibly across different files) as one atomic operation — either all succeed or none are written. Use this instead of several edit_file calls when a change spans multiple files, to avoid leaving the codebase half-edited if a later patch fails. Arguments: {"edits": [{"path": string, "old_str": string, "new_str": string}, ...]}',
     confirm: true,
     kind: 'edit',
+    // Same matching as run(), so the preview can never approve an edit the
+    // run then rejects (or the reverse). Edits to one file apply in order.
     preview: ({ edits }, root) => {
       if (!Array.isArray(edits) || edits.length === 0) return { path: '(multi_edit)', error: 'edits must be a non-empty array' };
-      const summaries = [];
+      const byPath = new Map();
       for (const e of edits) {
         const full = safePath(root, e.path);
-        if (!fs.existsSync(full)) return { path: e.path, error: `file not found: ${e.path}` };
-        const before = fs.readFileSync(full, 'utf8');
-        const count = before.split(e.old_str || '').length - 1;
+        if (!byPath.has(e.path)) {
+          if (!fs.existsSync(full)) return { path: e.path, error: `file not found: ${e.path}` };
+          const before = fs.readFileSync(full, 'utf8');
+          byPath.set(e.path, { path: e.path, before, after: before });
+        }
         if (!e.old_str) return { path: e.path, error: `old_str empty for ${e.path}` };
-        if (count === 0) return { path: e.path, error: `old_str not found in ${e.path}` };
-        if (count > 1) return { path: e.path, error: `old_str matches ${count} places in ${e.path}, needs more context` };
-        summaries.push(`${e.path}: 1 change`);
+        const entry = byPath.get(e.path);
+        const applied = applySnippet(entry.after, e.old_str, e.new_str);
+        if (!applied.ok) {
+          return {
+            path: e.path,
+            error: applied.reason === 'ambiguous' ? `old_str matches ${applied.count} places in ${e.path}, needs more context` : `old_str not found in ${e.path}`,
+          };
+        }
+        entry.after = applied.after;
       }
-      return { path: `${edits.length} file(s)`, before: '', after: summaries.join('\n') };
+      const files = [...byPath.values()];
+      const join = (side) => files.map((f) => `// ===== ${f.path} =====\n${f[side]}`).join('\n');
+      return { path: `${files.length} file(s)`, before: join('before'), after: join('after'), files };
     },
     run: ({ edits }, root) => {
       if (!Array.isArray(edits) || edits.length === 0) return 'ERROR: edits must be a non-empty array';
       // Validate every patch applies cleanly before writing anything, so a
       // failure partway through never leaves some files edited and others not.
-      const planned = [];
+      // Several edits to the same file apply in order on top of each other.
+      // Validating each against the original contents instead meant the
+      // last one silently overwrote the earlier ones on write.
+      const planned = new Map(); // path -> {full, after}
       for (const e of edits) {
         let full;
         try {
@@ -544,22 +757,25 @@ const tools = {
         } catch (err) {
           return `ERROR: ${err.message}`;
         }
-        if (!fs.existsSync(full)) return `ERROR: file not found: ${e.path} (no files were changed)`;
-        const before = fs.readFileSync(full, 'utf8');
+        if (!planned.has(e.path)) {
+          if (!fs.existsSync(full)) return `ERROR: file not found: ${e.path} (no files were changed)`;
+          planned.set(e.path, { full, after: fs.readFileSync(full, 'utf8') });
+        }
         if (!e.old_str) return `ERROR: old_str empty for ${e.path} (no files were changed)`;
-        const applied = applySnippet(before, e.old_str, e.new_str);
+        const entry = planned.get(e.path);
+        const applied = applySnippet(entry.after, e.old_str, e.new_str);
         if (!applied.ok) {
           return applied.reason === 'ambiguous'
             ? `ERROR: old_str matches ${applied.count} places in ${e.path}, needs more context (no files were changed)`
             : `ERROR: old_str not found in ${e.path} (no files were changed). ${NOT_FOUND_HINT}`;
         }
-        planned.push({ full, path: e.path, after: applied.after });
+        entry.after = applied.after;
       }
-      for (const p of planned) {
+      for (const [rel, p] of planned) {
         fs.writeFileSync(p.full, p.after);
-        markAgentWrite(root, p.path);
+        markAgentWrite(root, rel);
       }
-      return `OK: applied ${planned.length} edit(s) across ${new Set(planned.map((p) => p.path)).size} file(s): ${planned.map((p) => p.path).join(', ')}`;
+      return `OK: applied ${edits.length} edit(s) across ${planned.size} file(s): ${[...planned.keys()].join(', ')}`;
     },
   },
 
@@ -570,9 +786,9 @@ const tools = {
     readOnly: true,
     run: (_args, root) => {
       try {
-        const branch = execSync('git rev-parse --abbrev-ref HEAD', { cwd: root, encoding: 'utf8' }).trim();
-        const status = execSync('git status --porcelain', { cwd: root, encoding: 'utf8' });
-        const stat = execSync('git diff --stat HEAD', { cwd: root, encoding: 'utf8', maxBuffer: 1024 * 1024 * 5 });
+        const branch = git(root, ['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+        const status = git(root, ['status', '--porcelain']);
+        const stat = git(root, ['diff', '--stat', 'HEAD']);
         return truncate(`branch: ${branch}\n\n${status || '(working tree clean)'}\n${stat}`);
       } catch (err) {
         return `ERROR: ${err.stderr || err.message}`;
@@ -585,15 +801,12 @@ const tools = {
       'Show the actual diff of uncommitted changes, optionally for one path. Read this before writing a commit message so the message describes what really changed. Arguments: {"path": string (optional), "staged": boolean (optional)}',
     confirm: false,
     readOnly: true,
-    run: ({ path: p, staged }, root) => {
+    run: (/** @type {{path?: string, staged?: boolean}} */ { path: p, staged } = {}, root) => {
       try {
-        const target = p ? ` -- ${JSON.stringify(safePath(root, p))}` : '';
-        const out = execSync(`git diff ${staged ? '--staged' : ''}${target}`, {
-          cwd: root,
-          encoding: 'utf8',
-          maxBuffer: 1024 * 1024 * 10,
-        });
-        return truncate(out || '(no changes)');
+        const args = ['diff'];
+        if (staged) args.push('--staged');
+        if (p) args.push('--', safePath(root, p));
+        return truncate(git(root, args) || '(no changes)');
       } catch (err) {
         return `ERROR: ${err.stderr || err.message}`;
       }
@@ -609,16 +822,15 @@ const tools = {
       if (!message || !message.trim()) return 'ERROR: a commit message is required';
       try {
         if (Array.isArray(paths) && paths.length > 0) {
-          for (const p of paths) execSync(`git add ${JSON.stringify(safePath(root, p))}`, { cwd: root });
+          git(root, ['add', '--', ...paths.map((p) => safePath(root, p))]);
         } else {
-          execSync('git add -A', { cwd: root });
+          git(root, ['add', '-A']);
         }
-        const staged = execSync('git diff --staged --name-only', { cwd: root, encoding: 'utf8' }).trim();
+        const staged = git(root, ['diff', '--staged', '--name-only']).trim();
         if (!staged) return 'ERROR: nothing staged to commit';
-        // -F - keeps multi-line messages intact and avoids any shell quoting
-        // pitfalls with quotes/backticks in the message body.
-        execSync('git commit -F -', { cwd: root, input: message, encoding: 'utf8' });
-        const sha = execSync('git rev-parse --short HEAD', { cwd: root, encoding: 'utf8' }).trim();
+        // -F - keeps multi-line messages intact with no quoting involved.
+        git(root, ['commit', '-F', '-'], message);
+        const sha = git(root, ['rev-parse', '--short', 'HEAD']).trim();
         return `OK: committed ${sha}\n${staged}`;
       } catch (err) {
         return `ERROR: ${err.stderr || err.message}`;
@@ -661,15 +873,26 @@ const tools = {
     },
   },
 
-  update_tasks: {
+  // Named and shaped to look nothing like file editing: as "update_tasks"
+  // taking "a Markdown checklist", small models reached for it whenever a
+  // request mentioned bullets or a .md file, and reported the edit as done.
+  save_plan: {
     description:
-      'Record or update your plan for a multi-step task as a Markdown checklist (e.g. "- [x] read config\\n- [ ] add the route"). This list is stored on disk and shown back to you every turn, so it survives context trimming and /compact — use it on any task with more than ~3 steps, and re-send the full updated list each time you finish a step. Arguments: {"markdown": string}',
+      'Write down your own step-by-step plan for a long task (4+ steps) so it survives context trimming; it is shown back to you every turn. One step per line, prefix finished steps with "[x]". Changes no files. Arguments: {"steps": string}',
     confirm: false,
-    run: ({ markdown }, root) => {
-      if (typeof markdown !== 'string' || !markdown.trim()) return 'ERROR: markdown checklist is required';
-      saveTasks(root, markdown);
+    run: ({ steps, markdown }, root) => {
+      const text = typeof steps === 'string' ? steps : markdown;
+      if (typeof text !== 'string' || !text.trim()) return 'ERROR: steps is required';
+      // stored as a checklist so progress can be counted
+      const checklist = text
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean)
+        .map((l) => (/^[-*]\s+\[[ xX]\]/.test(l) ? l : /^\[[xX]\]/.test(l) ? `- ${l}` : `- [ ] ${l.replace(/^[-*\d.)]+\s*/, '')}`))
+        .join('\n');
+      saveTasks(root, checklist);
       const { done, total } = taskProgress(root);
-      return `OK: task list updated (${done}/${total} done)`;
+      return `OK: plan saved (${done}/${total} steps done). No files were changed.`;
     },
   },
 
@@ -678,7 +901,7 @@ const tools = {
       'Find where a function/class/const/variable named `name` is DEFINED (not just mentioned) — greps for common declaration patterns (function/class/const/let/def/interface/type) across the workspace. Faster and more precise than search_code when you know the symbol name. Arguments: {"name": string, "path": string (optional, default ".")}',
     confirm: false,
     readOnly: true,
-    run: async ({ name, path: p }, root) => {
+    run: async ({ name, path: p }, root, ctx) => {
       if (!name) return 'ERROR: name is required';
       // Ask the language server first: it knows which symbol is actually
       // meant, where grep only knows which lines contain the characters.
@@ -686,17 +909,10 @@ const tools = {
       if (viaLsp) return truncate(`(via language server)\n${viaLsp}`);
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const pattern = `(function|class|const|let|var|def|interface|type|struct|fn)\\s+${escaped}\\b|${escaped}\\s*[:=]\\s*(function|\\(|async)`;
-      try {
-        const dir = safePath(root, p || '.');
-        const out = execSync(
-          `grep -rnE --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.cortex -- ${JSON.stringify(pattern)} ${JSON.stringify(dir)}`,
-          { encoding: 'utf8', maxBuffer: 1024 * 1024 * 10 }
-        );
-        return truncate(out || `(no definition found for "${name}")`, LIMITS.search);
-      } catch (err) {
-        if (err.status === 1) return `(no definition found for "${name}")`;
-        return `ERROR: ${err.message}`;
-      }
+      const dir = safePath(root, p || '.');
+      const { ok, out } = await grep('-rnIE', pattern, dir, root, ctx?.signal);
+      if (!ok) return `ERROR: ${out}`;
+      return truncate(out || `(no definition found for "${name}")`, LIMITS.search);
     },
   },
 
@@ -705,28 +921,71 @@ const tools = {
       'Find every place `name` is USED/referenced across the workspace (all mentions, not just the definition) — use after find_symbol to see callers/usages before changing or removing something. Arguments: {"name": string, "path": string (optional, default ".")}',
     confirm: false,
     readOnly: true,
-    run: async ({ name, path: p }, root) => {
+    run: async ({ name, path: p }, root, ctx) => {
       if (!name) return 'ERROR: name is required';
       const viaLsp = await lsp.findReferences(root, name).catch(() => null);
       if (viaLsp) return truncate(`(via language server)\n${viaLsp}`);
-      try {
-        const dir = safePath(root, p || '.');
-        const out = execSync(
-          `grep -rn --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=.cortex -w -- ${JSON.stringify(name)} ${JSON.stringify(dir)}`,
-          { encoding: 'utf8', maxBuffer: 1024 * 1024 * 10 }
-        );
-        const lines = (out || '').trim().split('\n').filter(Boolean);
-        return truncate(lines.length ? `${lines.length} reference(s):\n${lines.join('\n')}` : `(no references found for "${name}")`, LIMITS.search);
-      } catch (err) {
-        if (err.status === 1) return `(no references found for "${name}")`;
-        return `ERROR: ${err.message}`;
-      }
+      const dir = safePath(root, p || '.');
+      const { ok, out } = await grep('-rnIwF', name, dir, root, ctx?.signal);
+      if (!ok) return `ERROR: ${out}`;
+      const lines = out.trim().split('\n').filter(Boolean);
+      return truncate(lines.length ? `${lines.length} reference(s):\n${lines.join('\n')}` : `(no references found for "${name}")`, LIMITS.search);
     },
   },
 };
 
-function toolListForPrompt() {
-  return Object.entries(tools).map(([name, t]) => `- ${name}: ${t.description}`).join('\n');
+// Tools that cannot work in the current context stay out of the prompt:
+// every listed tool costs prompt tokens on every step and is one more wrong
+// choice a small model can make. Calling one anyway gets a clear error.
+const AVAILABILITY = {
+  notify_webhook: (_root, ctx) => !!ctx?.webhookUrl,
+  delegate_task: (_root, ctx) => !!ctx?.delegateConfig && !((ctx.delegateDepth || 0) >= 1),
+  diagnostics: () => lsp.available(),
+  semantic_search: (root) => !!root && fs.existsSync(path.join(root, '.cortex', 'code-index.json')), // existence only — parsing it every step is costly
+  read_background_output: () => backgroundProcs.size > 0,
+  stop_background_process: () => backgroundProcs.size > 0,
+};
+
+function isToolAvailable(name, root, ctx) {
+  if (!tools[name]) return false;
+  const check = AVAILABILITY[name];
+  try {
+    return check ? !!check(root, ctx) : true;
+  } catch {
+    return false;
+  }
+}
+
+// Grouped, most-used first, so the tools a task almost always needs are the
+// first thing the model reads rather than scattered among niche ones.
+/** @type {Array<[string, string[]]>} */
+const TOOL_GROUPS = [
+  ['Explore', ['read_file', 'list_dir', 'search_code', 'find_symbol', 'find_references', 'semantic_search', 'diagnostics']],
+  ['Change files', ['edit_file', 'write_file', 'multi_edit', 'delete_file', 'rename_file']],
+  ['Run', ['run_command', 'run_background', 'read_background_output', 'stop_background_process']],
+  ['Git', ['git_status', 'git_diff', 'git_commit']],
+  ['Other', ['save_plan', 'remember', 'read_url', 'delegate_task', 'notify_webhook']],
+];
+
+/**
+ * @param {{root?: string, ctx?: object}} [opts]
+ */
+function toolListForPrompt({ root, ctx } = {}) {
+  const listed = new Set();
+  const sections = [];
+  for (const [title, names] of TOOL_GROUPS) {
+    const lines = names
+      .filter((n) => isToolAvailable(n, root, ctx))
+      .map((n) => {
+        listed.add(n);
+        return `- ${n}: ${tools[n].description}`;
+      });
+    if (lines.length) sections.push(`${title}:\n${lines.join('\n')}`);
+  }
+  // MCP and anything else registered at runtime
+  const extra = Object.keys(tools).filter((n) => !listed.has(n) && !TOOL_GROUPS.some(([, g]) => g.includes(n)));
+  if (extra.length) sections.push(`Connected tools:\n${extra.map((n) => `- ${n}: ${tools[n].description}`).join('\n')}`);
+  return sections.join('\n\n');
 }
 
 // Lets external integrations (currently: mcpManager.cjs) add/remove tools
@@ -741,4 +1000,4 @@ function unregisterExternalTool(name) {
   delete tools[name];
 }
 
-module.exports = { tools, toolListForPrompt, safePath, registerExternalTool, unregisterExternalTool };
+module.exports = { tools, toolListForPrompt, isToolAvailable, safePath, registerExternalTool, unregisterExternalTool, runShell };

@@ -18,6 +18,11 @@ const { parseToolCall } = require('./agentLoop.cjs');
 
 const DEFAULT_TIMEOUT_MS = 45_000;
 
+/**
+ * @param {{host: string, provider?: string, apiKey?: string, model: string, signal?: AbortSignal}} cfg
+ * @param {Array<{role: string, content: string}>} messages
+ * @param {{signal?: AbortSignal}} [opts]
+ */
 async function ask(cfg, messages, { signal } = {}) {
   return chat({
     host: cfg.host,
@@ -26,7 +31,7 @@ async function ask(cfg, messages, { signal } = {}) {
     model: cfg.model,
     temperature: 0,
     messages,
-    signal,
+    signal: signal || cfg.signal,
   });
 }
 
@@ -135,10 +140,12 @@ async function probeNativeTools(cfg) {
           },
         ],
       }),
-      signal: AbortSignal.timeout(cfg.timeoutMs || DEFAULT_TIMEOUT_MS),
+      signal: cfg.signal
+        ? AbortSignal.any([cfg.signal, AbortSignal.timeout(cfg.timeoutMs || DEFAULT_TIMEOUT_MS)])
+        : AbortSignal.timeout(cfg.timeoutMs || DEFAULT_TIMEOUT_MS),
     });
     if (!res.ok) return { ok: false, strict: false, detail: `server rejected tools (HTTP ${res.status})` };
-    const data = await res.json();
+    const data = /** @type {any} */ (await res.json());
     const calls = data?.message?.tool_calls;
     const used = Array.isArray(calls) && calls.length > 0;
     return {
@@ -160,9 +167,9 @@ const PROBES = [
 ];
 
 /**
- * @param {{host:string, provider?:string, apiKey?:string, model:string}} cfg
+ * @param {{host:string, provider?:string, apiKey?:string, model:string, timeoutMs?:number, signal?:AbortSignal}} cfg
  * @param {(id: string, label: string) => void} [onStep]
- * @returns {Promise<{model, results, score, verdict, recommended}>}
+ * @returns {Promise<{model: string, results: object, score: number|null, partialScore: number|null, completed: number, verdict: string, recommended: {model?: string, fastModel?: string, nativeTools?: boolean}, inconclusive: number, trustworthy: boolean}>}
  *   `recommended` is a settings patch the caller can apply to match the model.
  */
 async function probeModel(cfg, onStep) {
@@ -173,13 +180,23 @@ async function probeModel(cfg, onStep) {
   for (const probe of PROBES) {
     onStep?.(probe.id, probe.label);
     let r;
+    // The losing side of the race has to be cancelled, not just ignored: an
+    // abandoned request keeps its socket and timers alive long after the
+    // probe has moved on.
+    const controller = new AbortController();
+    let timer;
     try {
       r = await Promise.race([
-        probe.run(cfg),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('probe timed out')), cfg.timeoutMs || DEFAULT_TIMEOUT_MS)),
+        probe.run({ ...cfg, signal: controller.signal }),
+        new Promise((_, rej) => {
+          timer = setTimeout(() => rej(new Error('probe timed out')), cfg.timeoutMs || DEFAULT_TIMEOUT_MS);
+        }),
       ]);
     } catch (err) {
       r = { ok: false, strict: false, detail: err.message, inconclusive: true };
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
     }
     // A probe that timed out says nothing about the model — the server was
     // busy or the model was still loading. Scoring it as a failure would

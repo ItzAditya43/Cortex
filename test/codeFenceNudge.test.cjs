@@ -29,7 +29,7 @@ function serverReplying(replies) {
       res.end(JSON.stringify({ message: { content }, done: true }) + '\n');
     });
   });
-  return new Promise((resolve) => server.listen(0, () => resolve({ server, port: server.address().port, calls: () => n })));
+  return new Promise((resolve) => server.listen(0, () => resolve({ server, port: /** @type {import('net').AddressInfo} */ (server.address()).port, calls: () => n })));
 }
 
 async function run(port, prompt) {

@@ -35,3 +35,14 @@ test('parseToolCall: unterminated JSON reports an error', () => {
   assert.strictEqual(r.attempted, true);
   assert.strictEqual(r.ok, false);
 });
+
+test('parseToolCall: an undoubled regex backslash is kept literally, not a parse failure', () => {
+  // Models write code like s.replace(/\s+/g, '-') straight into a JSON
+  // string. "\s" is not a JSON escape, so this used to fail to parse, and
+  // the model resent the identical call until the step budget ran out.
+  const text = String.raw`TOOL_CALL: {"name": "edit_file", "arguments": {"path": "u.js", "old_str": "x.replace(/\s+/g, '-')", "new_str": "line1\nline2 \"q\" \d"}}`;
+  const r = parseToolCall(text);
+  assert.strictEqual(r.ok, true, r.error);
+  assert.strictEqual(r.data.arguments.old_str, String.raw`x.replace(/\s+/g, '-')`);
+  assert.strictEqual(r.data.arguments.new_str, 'line1\nline2 "q" \\d', 'valid escapes still decode');
+});

@@ -7,7 +7,7 @@
 
 const crypto = require('crypto');
 const { chat } = require('./provider.cjs');
-const { tools } = require('./tools.cjs');
+const { tools, isToolAvailable } = require('./tools.cjs');
 const { buildSystemPrompt } = require('./systemPrompt.cjs');
 const { buildContextMessages, DEFAULT_BUDGET_TOKENS } = require('./contextManager.cjs');
 const { verifySyntax } = require('./verify.cjs');
@@ -15,6 +15,7 @@ const { pickModel } = require('./router.cjs');
 const { getStaleWarning } = require('./fileTracker.cjs');
 const { classifyError } = require('./errorClassification.cjs');
 const lsp = require('./lsp.cjs');
+const { numCtxFor } = require('./ollamaClient.cjs');
 
 // Pull a TOOL_CALL: {...} instruction out of a model response.
 //
@@ -49,8 +50,16 @@ function parseToolCall(text) {
         continue;
       }
       if (ch === '\\') {
-        sanitized += ch;
-        escaped = true;
+        // Code in a string value often carries regex escapes the model did
+        // not double: "\s+", "\d", "\.". Those are illegal in JSON, so the
+        // whole call failed to parse and the model resent it unchanged until
+        // the step budget ran out. A backslash that doesn't start a valid
+        // JSON escape is a literal backslash — keep it as one.
+        const next = after[i + 1];
+        const validEscape =
+          next !== undefined && ('"\\/bfnrt'.includes(next) || (next === 'u' && /^[0-9a-fA-F]{4}$/.test(after.slice(i + 2, i + 6))));
+        sanitized += validEscape ? ch : '\\\\';
+        escaped = validEscape;
         continue;
       }
       if (ch === '"') {
@@ -183,12 +192,23 @@ function looksLikeNudgeArtifact(text) {
  * @param {{text: string, file?: string, startLine?: number, endLine?: number}} [opts.selection] currently highlighted editor text, if any
  * @param {boolean} [opts.planMode]       when true, mutating tools (write_file/edit_file/run_command) are blocked
  * @param {number} [opts.contextBudgetTokens] rough token budget for history sent per turn (see contextManager.cjs)
+ * @param {number} [opts.numCtx]          explicit Ollama context window; 0/undefined derives it from contextBudgetTokens
+ * @param {string} [opts.provider]        'ollama' (default) or 'openai-compatible'
+ * @param {string} [opts.apiKey]
+ * @param {string} [opts.escalateModel]   stronger model to switch to after repeated failures
+ * @param {string} [opts.testCommand]     run once after a turn that changed files; failures go back to the model
+ * @param {(command: string, result: string, failed: boolean) => void} [opts.onTestRun]
+ * @param {(usage: {promptTokens: number, completionTokens: number, totalDurationMs: number}) => void} [opts.onUsage]
+ * @param {(kind: string, message: string) => void} [opts.onRecovery]
+ * @param {(token: string) => void} [opts.onThinking]    reasoning tokens from thinking models, for display only
+ * @param {(step: number, model: string) => void} [opts.onStep]  a new model request is starting
  * @param {object} [opts.ctx]            passed through as tool.run's 3rd argument (webhook url, delegation config, etc.)
  * @param {AbortSignal} [opts.signal]
  * @param {(token: string) => void} opts.onToken           streamed assistant text
  * @param {(name: string, args: object, callId: string) => void} opts.onToolCall
  * @param {(name: string, args: object, callId: string) => Promise<boolean>} opts.requestApproval  called only for tools with confirm:true and autoApprove disabled
- * @param {(result: string, isError: boolean, callId: string, snapshot?: {path: string, before: string, after: string}) => void} opts.onToolResult
+ * @param {(result: string, isError: boolean, callId: string, snapshot?: {path: string, before: string, after: string, created?: boolean,
+ *   renameFrom?: string, renameTo?: string, files?: Array<{path: string, before: string, after: string, created?: boolean}>}) => void} opts.onToolResult
  * @param {(finalText: string, steps: number) => void} opts.onFinal
  * @param {(message: string) => void} opts.onError
  * @param {(message: string) => void} [opts.onLog]         optional diagnostic sink (wired to the host's OutputChannel)
@@ -210,11 +230,14 @@ async function runTurn(opts) {
     selection,
     planMode,
     contextBudgetTokens = DEFAULT_BUDGET_TOKENS,
+    numCtx,
     testCommand,
     onTestRun,
     ctx,
     signal,
     onToken,
+    onThinking,
+    onStep,
     onUsage,
     onRecovery,
     onToolCall,
@@ -235,6 +258,10 @@ async function runTurn(opts) {
   let rateLimitBackoffs = 0;
   const editFailuresByPath = new Map(); // path -> consecutive edit_file misses, drives the whole-file fallback
   const callSignatures = new Map(); // "tool(args)" -> times seen, for loop detection
+  // Tools see the turn's abort signal so Stop cancels a running command or
+  // search instead of waiting for it to finish.
+  const toolCtx = { ...(ctx || {}), signal };
+  const contextWindow = provider === 'openai-compatible' ? undefined : numCtxFor(contextBudgetTokens, numCtx);
 
   while (steps < maxSteps) {
     if (signal?.aborted) return;
@@ -247,13 +274,27 @@ async function runTurn(opts) {
     const escalating = !!escalateModel && escalateModel !== model && consecutiveFailures >= 2;
     const activeModel = escalating ? escalateModel : pickModel({ model, fastModel, usedMutatingTool, isFirstStep: steps === 1 });
     const routedLabel = escalating ? ' (escalated after repeated failures)' : activeModel !== model ? ' (routed: fast)' : '';
-    const system = buildSystemPrompt({ memoryNotes, cwd: root, openFile, planMode, selection });
+    const system = buildSystemPrompt({ memoryNotes, cwd: root, openFile, planMode, selection, ctx });
     const messages = buildContextMessages(system, history, contextBudgetTokens);
     onLog?.(`step ${steps}: sending ${messages.length} message(s) to ${activeModel}${routedLabel} (budget ${contextBudgetTokens} tok)`);
+    onStep?.(steps, activeModel);
 
     let reply;
     try {
-      reply = await chat({ host, provider, apiKey, model: activeModel, messages, temperature, signal, onToken, onUsage, logFn: onLog });
+      reply = await chat({
+        host,
+        provider,
+        apiKey,
+        model: activeModel,
+        messages,
+        temperature,
+        numCtx: contextWindow,
+        signal,
+        onToken,
+        onThinking,
+        onUsage,
+        logFn: onLog,
+      });
     } catch (err) {
       // Only stay silent when the USER actually cancelled. Any other abort
       // (a stalled model, a dropped connection) must be reported, or the
@@ -328,7 +369,7 @@ async function runTurn(opts) {
       if (usedMutatingTool && testCommand && !testRan && steps < maxSteps) {
         testRan = true;
         onLog?.(`step ${steps}: turn modified files — running test command: ${testCommand}`);
-        const testResult = await tools.run_command.run({ command: testCommand }, root, ctx);
+        const testResult = await tools.run_command.run({ command: testCommand }, root, toolCtx);
         const failed = /^ERROR|EXIT CODE: [1-9]/.test(testResult);
         onTestRun?.(testCommand, testResult, failed);
         if (failed) {
@@ -361,7 +402,7 @@ async function runTurn(opts) {
     // one. Anything mutating falls through to the single-call path below so
     // it keeps its own approval, diff and checkpoint.
     const allCalls = parseToolCalls(reply);
-    if (allCalls.length > 1 && allCalls.every((c) => c.ok && tools[c.data.name] && tools[c.data.name].readOnly)) {
+    if (allCalls.length > 1 && allCalls.every((c) => c.ok && tools[c.data.name]?.readOnly && isToolAvailable(c.data.name, root, ctx))) {
       const batch = allCalls.map((c) => ({ name: c.data.name, args: c.data.arguments || {}, callId: crypto.randomUUID() }));
       onLog?.(`step ${steps}: running ${batch.length} read-only tool calls in parallel`);
       for (const b of batch) onToolCall(b.name, b.args, b.callId);
@@ -369,7 +410,7 @@ async function runTurn(opts) {
       const settled = await Promise.all(
         batch.map(async (b) => {
           try {
-            const out = await tools[b.name].run(b.args, root, ctx);
+            const out = await tools[b.name].run(b.args, root, toolCtx);
             return { ...b, result: out, isError: typeof out === 'string' && out.startsWith('ERROR') };
           } catch (err) {
             return { ...b, result: `ERROR running tool: ${err.message}`, isError: true };
@@ -390,8 +431,11 @@ async function runTurn(opts) {
     const toolCall = parsed.data;
     const tool = tools[toolCall.name];
 
-    if (!tool) {
-      const msg = `ERROR: unknown tool "${toolCall.name}". Available: ${Object.keys(tools).join(', ')}`;
+    if (!tool || !isToolAvailable(toolCall.name, root, ctx)) {
+      const available = Object.keys(tools).filter((n) => isToolAvailable(n, root, ctx));
+      const msg = tool
+        ? `ERROR: the "${toolCall.name}" tool is not available here. Available: ${available.join(', ')}`
+        : `ERROR: unknown tool "${toolCall.name}". Available: ${available.join(', ')}`;
       history.push({ role: 'user', content: `TOOL_RESULT: ${msg}` });
       onToolResult(msg, true, null);
       continue;
@@ -447,6 +491,9 @@ async function runTurn(opts) {
 
     if (tool.confirm) {
       const approved = await requestApproval(toolCall.name, args, callId);
+      // Stop pressed while the approval card was open: the turn is over, and
+      // a late click must not run the action anyway.
+      if (signal?.aborted) return;
       if (!approved) {
         const msg = 'User declined this action. Choose a different approach or ask the user what they want instead.';
         history.push({ role: 'user', content: `TOOL_RESULT: ${msg}` });
@@ -459,7 +506,7 @@ async function runTurn(opts) {
     if (tool.preview) {
       try {
         const p = tool.preview(args, root);
-        if (p && p.before !== undefined) snapshot = { path: p.path, before: p.before, after: p.after };
+        if (p && p.before !== undefined && !p.error) snapshot = { ...p };
       } catch {
         // preview is best-effort for checkpointing; ignore failures here
       }
@@ -471,14 +518,22 @@ async function runTurn(opts) {
     // Claude/GPT-class models, so this closes a real gap cheaply.
     let verification = null;
     if (snapshot && snapshot.after !== undefined) {
-      verification = verifySyntax(snapshot.path, snapshot.after);
+      // multi_edit carries one entry per file; its top-level path is a label.
+      for (const f of snapshot.files || [snapshot]) {
+        const v = verifySyntax(f.path, f.after);
+        if (v && v.ok === false) {
+          verification = { ...v, message: snapshot.files ? `${f.path}: ${v.message}` : v.message };
+          break;
+        }
+        if (v) verification = v;
+      }
       if (verification) snapshot.verification = verification;
     }
 
     let result;
     let isError = false;
     try {
-      result = await tool.run(args, root, ctx);
+      result = await tool.run(args, root, toolCtx);
       isError = typeof result === 'string' && result.startsWith('ERROR');
     } catch (err) {
       result = `ERROR running tool: ${err.message}`;
@@ -523,6 +578,15 @@ async function runTurn(opts) {
       }
     } else if (!isError && tool.kind === 'edit' && args.path) {
       editFailuresByPath.delete(args.path);
+    }
+
+    // A response holding a mutating call plus others only runs the first one
+    // (each change needs its own approval and checkpoint). Left unsaid, the
+    // model assumes the rest ran too and reports work that never happened.
+    if (allCalls.length > 1) {
+      result +=
+        `\n\nNOTE: your response contained ${allCalls.length} tool calls, but only this first one was run — calls that change ` +
+        `something must each be sent alone. Send the next one now if it is still needed.`;
     }
 
     history.push({ role: 'user', content: `TOOL_RESULT:\n${result}` });

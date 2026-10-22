@@ -28,6 +28,16 @@ function checkBwrap() {
 }
 
 /**
+ * Quotes one argument for /bin/sh. Single quotes are the only form the
+ * shell does no expansion inside; JSON-style double quotes still run
+ * $(...) and backticks.
+ * @param {string} s
+ */
+function shellQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+/**
  * Wraps a shell command to run inside a bubblewrap sandbox: workspace root
  * is the only writable path, rest of the filesystem is read-only, and
  * network is disabled unless allowNetwork is set.
@@ -39,9 +49,10 @@ function checkBwrap() {
  */
 function wrapCommand(command, root, opts = {}) {
   if (!checkBwrap()) return { command, sandboxed: false };
-  // bwrap's argv handles quoting of the inner command via a separate exec
-  // (bash -c <command>); we shell-quote the whole invocation once here since
-  // it's handed to execSync/spawn(..., {shell: true}).
+  // The whole invocation is handed to a shell (spawn with shell: true), so
+  // every argument is single-quoted. Double quotes here let the OUTER shell
+  // expand $(...) in the command before bwrap ever started — the command
+  // ran unsandboxed, and on-request auto-approves sandboxed commands.
   // Mount order matters to bwrap: later binds win over earlier ones at an
   // overlapping path. --tmpfs /tmp must come before the workspace bind, or a
   // workspace root that happens to live under /tmp (as scratch/test dirs
@@ -53,17 +64,17 @@ function wrapCommand(command, root, opts = {}) {
     '--dev', '/dev',
     '--proc', '/proc',
     '--tmpfs', '/tmp',
-    '--bind', JSON.stringify(root), JSON.stringify(root),
+    '--bind', shellQuote(root), shellQuote(root),
     '--unshare-pid',
     '--unshare-ipc',
     '--unshare-uts',
     '--die-with-parent',
     ...(opts.allowNetwork ? [] : ['--unshare-net']),
-    '--chdir', JSON.stringify(root),
+    '--chdir', shellQuote(root),
     '--',
-    'bash', '-c', JSON.stringify(command),
+    'bash', '-c', shellQuote(command),
   ].join(' ');
   return { command: quoted, sandboxed: true };
 }
 
-module.exports = { wrapCommand, checkBwrap };
+module.exports = { wrapCommand, checkBwrap, shellQuote };

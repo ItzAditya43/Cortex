@@ -1,5 +1,6 @@
 (function () {
   const vscode = acquireVsCodeApi();
+  const { escapeHtml, renderMarkdown, splitStreamingReply, summarizeArgs, diffViewHtml } = window.CortexRender;
 
   const messagesEl = document.getElementById('messages');
   const inputEl = document.getElementById('input');
@@ -35,100 +36,7 @@
     if (sessionStats.lastPrompt && sessionStats.contextBudget) {
       parts.push(`${Math.round((sessionStats.lastPrompt / sessionStats.contextBudget) * 100)}% ctx`);
     }
-    sessionStatsEl.textContent = parts.join(' \u00b7 ');
-  }
-
-  // ---------- tiny, dependency-free markdown renderer ----------
-  // Supports: fenced code blocks, inline code, bold/italic, headings,
-  // bullet/numbered lists, links. Escapes HTML first so nothing else in the
-  // text can inject markup.
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  }
-
-  function renderInline(text) {
-    let s = escapeHtml(text);
-    s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
-    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-    s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
-    s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="#" data-href="$2" class="md-link">$1</a>');
-    return s;
-  }
-
-  function renderMarkdown(text) {
-    const lines = String(text || '').split('\n');
-    let html = '';
-    let i = 0;
-    let inList = null; // 'ul' | 'ol'
-
-    function closeList() {
-      if (inList) {
-        html += inList === 'ul' ? '</ul>' : '</ol>';
-        inList = null;
-      }
-    }
-
-    while (i < lines.length) {
-      const line = lines[i];
-
-      const fence = line.match(/^```(\w*)\s*$/);
-      if (fence) {
-        closeList();
-        const lang = fence[1] || '';
-        const codeLines = [];
-        i++;
-        while (i < lines.length && !/^```\s*$/.test(lines[i])) {
-          codeLines.push(lines[i]);
-          i++;
-        }
-        i++; // skip closing fence
-        html += `<pre class="md-code"${lang ? ` data-lang="${escapeHtml(lang)}"` : ''}><code>${escapeHtml(codeLines.join('\n'))}</code></pre>`;
-        continue;
-      }
-
-      const heading = line.match(/^(#{1,4})\s+(.*)$/);
-      if (heading) {
-        closeList();
-        const level = heading[1].length;
-        html += `<h${level} class="md-h">${renderInline(heading[2])}</h${level}>`;
-        i++;
-        continue;
-      }
-
-      const bullet = line.match(/^\s*[-*]\s+(.*)$/);
-      if (bullet) {
-        if (inList !== 'ul') {
-          closeList();
-          html += '<ul class="md-list">';
-          inList = 'ul';
-        }
-        html += `<li>${renderInline(bullet[1])}</li>`;
-        i++;
-        continue;
-      }
-
-      const numbered = line.match(/^\s*\d+[.)]\s+(.*)$/);
-      if (numbered) {
-        if (inList !== 'ol') {
-          closeList();
-          html += '<ol class="md-list">';
-          inList = 'ol';
-        }
-        html += `<li>${renderInline(numbered[1])}</li>`;
-        i++;
-        continue;
-      }
-
-      closeList();
-      if (line.trim() === '') {
-        html += '<div class="md-br"></div>';
-      } else {
-        html += `<p class="md-p">${renderInline(line)}</p>`;
-      }
-      i++;
-    }
-    closeList();
-    return html;
+    sessionStatsEl.textContent = parts.join(' · ');
   }
 
   function bindLinks(container) {
@@ -139,6 +47,18 @@
       });
     });
   }
+
+  // Copy buttons on code blocks — delegated, since bubbles are re-rendered
+  // on every streamed token.
+  messagesEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('.copy-btn');
+    if (!btn) return;
+    const code = btn.closest('.code-wrap')?.querySelector('code');
+    if (!code) return;
+    vscode.postMessage({ type: 'copy', text: code.textContent });
+    btn.textContent = 'Copied';
+    setTimeout(() => (btn.textContent = 'Copy'), 1200);
+  });
 
   // Stick-to-bottom, rather than force-to-bottom.
   //
@@ -167,6 +87,48 @@
     if (jumpBtn) jumpBtn.classList.add('hidden');
   }
 
+  // ---------- working indicator ----------
+  // Local models can take a long time before the first token: loading the
+  // model, evaluating the prompt on CPU. A panel that shows nothing in that
+  // window looks frozen, so there is always a visible "what it's doing now"
+  // line at the end of the transcript while a turn runs.
+  let workingEl = null;
+  let workingTimer = null;
+  let workingSince = 0;
+
+  function setWorking(label) {
+    if (!label) {
+      if (workingEl) workingEl.remove();
+      workingEl = null;
+      clearInterval(workingTimer);
+      workingTimer = null;
+      return;
+    }
+    if (!workingEl) {
+      workingEl = document.createElement('div');
+      workingEl.className = 'working';
+      workingEl.innerHTML = '<span class="spinner"></span><span class="working-label"></span><span class="working-time"></span>';
+      workingSince = Date.now();
+      workingTimer = setInterval(updateWorkingTime, 1000);
+    }
+    workingEl.querySelector('.working-label').textContent = label;
+    messagesEl.appendChild(workingEl); // always last
+    updateWorkingTime();
+    scrollToBottom();
+  }
+
+  function updateWorkingTime() {
+    if (!workingEl) return;
+    const secs = Math.floor((Date.now() - workingSince) / 1000);
+    workingEl.querySelector('.working-time').textContent = secs >= 3 ? `${secs}s` : '';
+  }
+
+  // Everything appended to the transcript goes above the working line.
+  function append(el) {
+    if (workingEl && workingEl.parentNode === messagesEl) messagesEl.insertBefore(el, workingEl);
+    else messagesEl.appendChild(el);
+  }
+
   function showEmptyState() {
     if (messagesEl.querySelector('.empty-state') || messagesEl.children.length) return;
     const div = document.createElement('div');
@@ -179,8 +141,19 @@
         </svg>
       </div>
       <div class="empty-title">Ask Cortex anything</div>
-      <div class="empty-sub">It can read, write, and run code in this workspace. Try "list the files here" to start.</div>
+      <div class="empty-sub">It can read, write, and run code in this workspace.</div>
+      <div class="empty-examples">
+        <button class="example">Explain how this project is structured</button>
+        <button class="example">Find and fix a bug in the open file</button>
+        <button class="example">Write tests for the selected code</button>
+      </div>
     `;
+    div.querySelectorAll('.example').forEach((b) =>
+      b.addEventListener('click', () => {
+        inputEl.value = b.textContent;
+        inputEl.focus();
+      })
+    );
     messagesEl.appendChild(div);
   }
 
@@ -204,43 +177,101 @@
       span.textContent = text;
       div.appendChild(span);
     }
-    messagesEl.appendChild(div);
+    append(div);
     currentAssistantEl = null;
     currentAssistantBuf = '';
+    thinking = null;
     scrollToBottom(true); // sending is an explicit request to see the newest message
   }
 
-  function addSystemNote(text) {
+  function addSystemNote(text, cls) {
     const div = document.createElement('div');
-    div.className = 'msg system';
+    div.className = 'msg system' + (cls ? ` ${cls}` : '');
     div.textContent = text;
-    messagesEl.appendChild(div);
+    append(div);
     scrollToBottom();
   }
 
+  // ---------- thinking (reasoning models) ----------
+  let thinking = null; // {el, buf, startedAt, done}
+
+  function appendThinking(text) {
+    if (!thinking || thinking.done) {
+      const el = document.createElement('details');
+      el.className = 'thinking';
+      el.innerHTML = '<summary><span class="thinking-label">Thinking…</span></summary><div class="thinking-body"></div>';
+      append(el);
+      thinking = { el, buf: '', startedAt: Date.now(), done: false };
+      setWorking(null);
+    }
+    thinking.buf += text;
+    thinking.el.querySelector('.thinking-body').textContent = thinking.buf;
+    scrollToBottom();
+  }
+
+  function finishThinking() {
+    if (!thinking || thinking.done) return;
+    thinking.done = true;
+    const secs = Math.max(1, Math.round((Date.now() - thinking.startedAt) / 1000));
+    thinking.el.querySelector('.thinking-label').textContent = `Thought for ${secs}s`;
+  }
+
+  // ---------- streaming assistant reply ----------
   function ensureAssistantBubble() {
     if (!currentAssistantEl) {
       currentAssistantEl = document.createElement('div');
       currentAssistantEl.className = 'msg assistant';
-      messagesEl.appendChild(currentAssistantEl);
+      append(currentAssistantEl);
     }
     return currentAssistantEl;
   }
 
-  function appendToken(text) {
-    currentAssistantBuf += text;
-    const el = ensureAssistantBubble();
-    el.innerHTML = renderMarkdown(currentAssistantBuf);
-    bindLinks(el);
+  // Re-rendering markdown for every token is quadratic over a long reply;
+  // batching to one render per animation frame keeps it smooth.
+  let renderQueued = false;
+  function scheduleRender() {
+    if (renderQueued) return;
+    renderQueued = true;
+    requestAnimationFrame(() => {
+      renderQueued = false;
+      renderStreaming();
+    });
+  }
+
+  function renderStreaming() {
+    if (!currentAssistantBuf) return;
+    const { text, toolPending, toolName } = splitStreamingReply(currentAssistantBuf);
+    if (text.trim()) {
+      const el = ensureAssistantBubble();
+      el.innerHTML = renderMarkdown(text);
+      bindLinks(el);
+    } else if (currentAssistantEl) {
+      currentAssistantEl.remove();
+      currentAssistantEl = null;
+    }
+    if (toolPending) setWorking(toolName ? `Preparing ${toolName}…` : 'Preparing a tool call…');
+    else if (text.trim()) setWorking(null);
     scrollToBottom();
   }
 
+  function appendToken(text) {
+    finishThinking();
+    currentAssistantBuf += text;
+    scheduleRender();
+  }
+
   function finalizeAssistant(text, steps, elapsedMs) {
+    finishThinking();
+    setWorking(null);
+    const finalContent = text || splitStreamingReply(currentAssistantBuf).text;
+    if (!finalContent && !currentAssistantEl) {
+      currentAssistantBuf = '';
+      return;
+    }
     const el = ensureAssistantBubble();
-    const finalContent = text || currentAssistantBuf;
     el.innerHTML = renderMarkdown(finalContent);
     bindLinks(el);
-    if (typeof elapsedMs === 'number') {
+    if (typeof elapsedMs === 'number' && elapsedMs > 0) {
       const stats = document.createElement('div');
       stats.className = 'turn-stats';
       const secs = (elapsedMs / 1000).toFixed(1);
@@ -252,57 +283,33 @@
     scrollToBottom();
   }
 
+  // ---------- tool cards ----------
   const TOOL_ICONS = {
     read_file: '📖',
     write_file: '📝',
     edit_file: '✏️',
+    multi_edit: '✏️',
+    delete_file: '🗑',
+    rename_file: '🔀',
     list_dir: '📁',
     search_code: '🔍',
+    semantic_search: '🔍',
+    find_symbol: '🔎',
+    find_references: '🔎',
     run_command: '⚡',
+    run_background: '⚡',
+    read_background_output: '📟',
+    stop_background_process: '⏹',
+    git_status: '🌿',
+    git_diff: '🌿',
+    git_commit: '🌿',
+    diagnostics: '🩺',
+    read_url: '🌐',
     remember: '🧠',
+    save_plan: '☑',
+    delegate_task: '🤝',
+    notify_webhook: '🔔',
   };
-
-  // Returns { html, add, del } — a cheap line-level diff (no LCS), good
-  // enough for the small, targeted edits this agent makes.
-  function diffHtmlAndStats(diff) {
-    if (!diff || diff.error) return null;
-    const before = (diff.before || '').split('\n');
-    const after = (diff.after || '').split('\n');
-    if (before.join('\n') === after.join('\n')) {
-      return { html: '<div class="diff-line">(no changes)</div>', add: 0, del: 0 };
-    }
-    let html = '';
-    let add = 0;
-    let del = 0;
-    const max = Math.max(before.length, after.length);
-    let sameCount = 0;
-    for (let i = 0; i < max; i++) {
-      if (before[i] === after[i]) sameCount++;
-    }
-    if (sameCount / max > 0.4) {
-      for (let i = 0; i < max; i++) {
-        if (before[i] === after[i]) {
-          if (before[i] !== undefined) html += `<span class="diff-line">  ${escapeHtml(before[i])}</span>\n`;
-        } else {
-          if (before[i] !== undefined) {
-            html += `<span class="diff-line diff-del">- ${escapeHtml(before[i])}</span>\n`;
-            del++;
-          }
-          if (after[i] !== undefined) {
-            html += `<span class="diff-line diff-add">+ ${escapeHtml(after[i])}</span>\n`;
-            add++;
-          }
-        }
-      }
-    } else {
-      html += before.map((l) => `<span class="diff-line diff-del">- ${escapeHtml(l)}</span>`).join('\n');
-      html += '\n';
-      html += after.map((l) => `<span class="diff-line diff-add">+ ${escapeHtml(l)}</span>`).join('\n');
-      del = before.length;
-      add = after.length;
-    }
-    return { html, add, del };
-  }
 
   function setStatPill(block, add, del) {
     const header = block.querySelector('.tool-header');
@@ -311,41 +318,56 @@
     if (!pill) {
       pill = document.createElement('span');
       pill.className = 'stat-pill';
-      header.insertBefore(pill, header.querySelector('.collapse-hint'));
+      header.insertBefore(pill, header.querySelector('.status'));
     }
     pill.innerHTML = `${add ? `<span class="stat-add">+${add}</span>` : ''}${del ? `<span class="stat-del">-${del}</span>` : ''}`;
   }
 
-  function addToolCall(name, args, id) {
-    // The streaming bubble was filled live with the model's raw output,
-    // which includes the literal "TOOL_CALL: {...}" line now being replaced
-    // by the clean card below — left as-is it duplicates as ugly raw JSON
-    // text in the transcript. Keep any real commentary the model wrote
-    // before the marker, discard the rest.
-    if (currentAssistantEl) {
-      const idx = currentAssistantBuf.indexOf('TOOL_CALL:');
-      const commentary = (idx === -1 ? currentAssistantBuf : currentAssistantBuf.slice(0, idx)).trim();
-      if (commentary) {
-        currentAssistantEl.innerHTML = renderMarkdown(commentary);
-        bindLinks(currentAssistantEl);
-      } else {
-        currentAssistantEl.remove();
-      }
-    }
-    currentAssistantEl = null;
-    currentAssistantBuf = '';
+  function setStatus(block, state) {
+    const el = block.querySelector('.status');
+    if (!el) return;
+    el.className = `status ${state}`;
+    el.textContent = state === 'ok' ? '✓' : state === 'error' ? '✗' : state === 'waiting' ? 'needs approval' : '';
+  }
+
+  function createToolCard(name, args, id, { readOnly = false } = {}) {
     const block = document.createElement('div');
     block.className = 'tool-block';
     if (id) block.dataset.callId = id;
+    if (readOnly) block.dataset.readOnly = '1';
     const header = document.createElement('div');
     header.className = 'tool-header';
-    header.innerHTML = `<span class="icon">${TOOL_ICONS[name] || '🔧'}</span><span class="name">${escapeHtml(name)}</span><span class="args">${escapeHtml(JSON.stringify(args || {}))}</span><span class="collapse-hint">▾</span>`;
+    header.innerHTML =
+      `<span class="icon">${TOOL_ICONS[name] || '🔧'}</span><span class="name">${escapeHtml(name)}</span>` +
+      `<span class="args">${escapeHtml(summarizeArgs(name, args))}</span>` +
+      `<span class="status running"></span><span class="collapse-hint">▾</span>`;
+    header.title = JSON.stringify(args || {}, null, 2).slice(0, 2000);
     header.addEventListener('click', (e) => {
       if (e.target.closest('button')) return;
       block.classList.toggle('collapsed');
     });
     block.appendChild(header);
-    messagesEl.appendChild(block);
+    append(block);
+    return block;
+  }
+
+  function addToolCall(name, args, id, readOnly) {
+    // Keep the prose the model wrote before the TOOL_CALL marker. Rendered
+    // from the buffer, not the bubble: a fast model can deliver the call
+    // before the next animation frame has created the bubble at all.
+    const { text } = splitStreamingReply(currentAssistantBuf);
+    if (text.trim()) {
+      const el = ensureAssistantBubble();
+      el.innerHTML = renderMarkdown(text);
+      bindLinks(el);
+    } else if (currentAssistantEl) {
+      currentAssistantEl.remove();
+    }
+    finishThinking();
+    currentAssistantEl = null;
+    currentAssistantBuf = '';
+    const block = createToolCard(name, args, id, { readOnly });
+    setWorking(`Running ${name}…`);
     scrollToBottom();
     return block;
   }
@@ -355,24 +377,37 @@
     return messagesEl.querySelector(`.tool-block[data-call-id="${id}"]`);
   }
 
-  function addApprovalUI(id, name, args, preview, diffId) {
+  function appendDiff(block, diffView) {
+    if (!diffView) return;
+    const html = diffViewHtml(diffView);
+    if (!html) return;
+    const body = document.createElement('div');
+    body.className = 'tool-body diff';
+    body.innerHTML = html;
+    block.appendChild(body);
+    setStatPill(block, diffView.add, diffView.del);
+  }
+
+  function addApprovalUI(id, name, args, previewError, diffView, diffId) {
     // The 'toolCall' event (fired first, for every call) already created
     // this card — reuse it instead of spawning a duplicate.
     const block = findToolBlock(id) || addToolCall(name, args, id);
+    setWorking(null);
+    setStatus(block, 'waiting');
+    block.classList.remove('collapsed');
 
-    if (preview && !preview.error) {
-      const diffResult = diffHtmlAndStats(preview);
-      if (diffResult) {
-        const body = document.createElement('div');
-        body.className = 'tool-body';
-        body.innerHTML = diffResult.html;
-        block.appendChild(body);
-        setStatPill(block, diffResult.add, diffResult.del);
-      }
-    } else if (preview && preview.error) {
+    if (previewError) {
       const body = document.createElement('div');
       body.className = 'tool-body error';
-      body.textContent = preview.error;
+      body.textContent = previewError;
+      block.appendChild(body);
+    } else {
+      appendDiff(block, diffView);
+    }
+    if (name === 'run_command' || name === 'run_background') {
+      const body = document.createElement('div');
+      body.className = 'tool-body command';
+      body.textContent = `$ ${args && args.command}`;
       block.appendChild(body);
     }
 
@@ -392,12 +427,13 @@
     rejectBtn.textContent = 'Reject';
 
     function resolve(approved) {
+      // Remembered on the card so the result that follows knows whether to
+      // render: an approved action's output is the whole point of the card.
+      block.dataset.verdict = approved ? 'approved' : 'rejected';
       row.classList.add('resolved');
-      const verdict = document.createElement('span');
-      verdict.className = 'verdict';
-      verdict.textContent = approved ? 'Approved' : 'Rejected';
-      row.innerHTML = '';
-      row.appendChild(verdict);
+      row.innerHTML = `<span class="verdict">${approved ? 'Approved' : 'Rejected'}</span>`;
+      setStatus(block, approved ? 'running' : 'error');
+      if (approved) setWorking(`Running ${name}…`);
       vscode.postMessage({ type: 'approve', id, approved });
     }
 
@@ -407,34 +443,45 @@
     row.appendChild(rejectBtn);
     block.appendChild(row);
     scrollToBottom();
+    approveBtn.focus({ preventScroll: true });
   }
 
-  function addToolResult(result, isError, id, revertAvailable, diff) {
+  function cancelApproval(id) {
+    const block = findToolBlock(id);
+    if (!block) return;
+    const row = block.querySelector('.approval-row');
+    if (row && !row.classList.contains('resolved')) {
+      block.dataset.verdict = 'cancelled';
+      row.classList.add('resolved');
+      row.innerHTML = '<span class="verdict">Cancelled</span>';
+      setStatus(block, 'error');
+    }
+  }
+
+  function addToolResult(result, isError, id, revertAvailable, diffView) {
     if (!id) {
       addSystemNote(`⚠ ${result}`);
       return;
     }
     const block = findToolBlock(id);
     if (!block) return;
-    if (block.querySelector('.approval-row')) return; // already resolved visually
+    setStatus(block, isError ? 'error' : 'ok');
+    // A rejected/cancelled card already says so; the "User declined" text
+    // that goes back to the model would only repeat it.
+    if (block.dataset.verdict === 'rejected' || block.dataset.verdict === 'cancelled') return;
 
     // Auto-approved edits skip the approval step, so this is the first
     // chance to show what actually changed — same diff view either way.
-    if (diff && !diff.error) {
-      const diffResult = diffHtmlAndStats(diff);
-      if (diffResult) {
-        const diffBody = document.createElement('div');
-        diffBody.className = 'tool-body';
-        diffBody.innerHTML = diffResult.html;
-        block.appendChild(diffBody);
-        setStatPill(block, diffResult.add, diffResult.del);
-      }
-    }
+    appendDiff(block, diffView);
 
     const body = document.createElement('div');
-    body.className = 'tool-body' + (isError ? ' error' : '');
+    body.className = 'tool-body result' + (isError ? ' error' : '');
     body.textContent = result;
     block.appendChild(body);
+
+    // Successful reads are reference material, not news: keep the card to
+    // its header so the transcript stays readable. Errors stay open.
+    if (block.dataset.readOnly && !isError) block.classList.add('collapsed');
 
     if (revertAvailable && id) {
       const footer = document.createElement('div');
@@ -450,6 +497,7 @@
       footer.appendChild(revertBtn);
       block.appendChild(footer);
     }
+    if (busy) setWorking('Thinking…');
     scrollToBottom();
   }
 
@@ -460,11 +508,37 @@
     if (footer) footer.innerHTML = `<span class="verdict">Reverted ${escapeHtml(path)}</span>`;
   }
 
+  // Sub-agent progress lands inside the delegate_task card that started it.
+  function addSubTaskLine(text, isError) {
+    const cards = messagesEl.querySelectorAll('.tool-block');
+    const card = [...cards].reverse().find((c) => c.querySelector('.name')?.textContent === 'delegate_task');
+    if (!card) return;
+    let body = card.querySelector('.subtask-log');
+    if (!body) {
+      body = document.createElement('div');
+      body.className = 'tool-body subtask-log';
+      card.appendChild(body);
+    }
+    const line = document.createElement('div');
+    line.className = isError ? 'error' : '';
+    line.textContent = text;
+    body.appendChild(line);
+    scrollToBottom();
+  }
+
   function setBusy(value) {
     busy = value;
     sendBtn.classList.toggle('hidden', value);
     stopBtn.classList.toggle('hidden', !value);
-    inputEl.disabled = value;
+    if (value) {
+      if (!workingEl) setWorking('Thinking…');
+    } else {
+      setWorking(null);
+      finishThinking();
+      // Leave the bubble's visible text as-is but stop treating it as live.
+      if (currentAssistantEl && currentAssistantBuf) renderStreaming();
+      setWorking(null);
+    }
   }
 
   let pendingImage = null; // data: URL of an attached image, cleared after send
@@ -508,14 +582,27 @@
     });
   }
 
+  // Pasting a screenshot straight into the composer attaches it.
+  inputEl.addEventListener('paste', (e) => {
+    const item = [...(e.clipboardData?.items || [])].find((i) => i.type.startsWith('image/'));
+    if (!item) return;
+    e.preventDefault();
+    const reader = new FileReader();
+    reader.onload = () => setPendingImage(reader.result);
+    reader.readAsDataURL(item.getAsFile());
+  });
+
   if (jumpBtn) jumpBtn.addEventListener('click', () => scrollToBottom(true));
+  if (modelBadge) modelBadge.addEventListener('click', () => vscode.postMessage({ type: 'selectModel' }));
 
   sendBtn.addEventListener('click', send);
   stopBtn.addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
   inputEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       send();
+    } else if (e.key === 'Escape' && busy) {
+      vscode.postMessage({ type: 'stop' });
     }
   });
 
@@ -531,7 +618,7 @@
     inputEl.placeholder =
       mode === 'plan'
         ? 'Ask Cortex to investigate and propose a plan (no changes will be made)...'
-        : 'Ask Cortex to do something in this workspace...';
+        : 'Ask Cortex to do something in this workspace... (Enter to send, Shift+Enter for a new line)';
   }
 
   // ---------- Manual/Auto approval toggle ----------
@@ -621,7 +708,8 @@
     approvalsPanel.innerHTML = '<div class="panel-title">Auto-approve per action</div>';
     const note = document.createElement('div');
     note.className = 'panel-note';
-    note.textContent = 'When checked, Cortex will run this action without asking. Global "autoApprove" setting overrides all of these.';
+    note.textContent =
+      'When checked, Cortex will run this action without asking. The Auto switch overrides all of these. Dangerous commands (rm -rf, sudo, force-push, …) always ask.';
     approvalsPanel.appendChild(note);
     for (const name of toolNames) {
       const row = document.createElement('label');
@@ -678,12 +766,18 @@
     memoryPanel.appendChild(row);
   }
 
-  function restoreSession(messages) {
+  function resetTranscript() {
+    setWorking(null);
     messagesEl.innerHTML = '';
     currentAssistantEl = null;
     currentAssistantBuf = '';
+    thinking = null;
+  }
+
+  function restoreSession(messages) {
+    resetTranscript();
     if (!messages.length) {
-      addSystemNote('(empty chat)');
+      showEmptyState();
       return;
     }
     for (const m of messages) {
@@ -693,10 +787,20 @@
         div.className = 'msg assistant';
         div.innerHTML = renderMarkdown(m.text);
         bindLinks(div);
-        messagesEl.appendChild(div);
+        append(div);
+      } else if (m.role === 'tool') {
+        const block = createToolCard(m.name, m.args, null);
+        setStatus(block, m.result === undefined ? '' : m.isError ? 'error' : 'ok');
+        if (m.result !== undefined) {
+          const body = document.createElement('div');
+          body.className = 'tool-body result' + (m.isError ? ' error' : '');
+          body.textContent = m.result;
+          block.appendChild(body);
+        }
+        block.classList.add('collapsed');
       } else addSystemNote(m.text);
     }
-    scrollToBottom();
+    scrollToBottom(true);
   }
 
   window.addEventListener('message', (event) => {
@@ -734,21 +838,39 @@
         const div = document.createElement('div');
         div.className = 'msg system' + (msg.failed ? ' test-fail' : ' test-pass');
         div.textContent = `${msg.failed ? '✗' : '✓'} ${msg.command}\n${msg.result.slice(0, 400)}`;
-        messagesEl.appendChild(div);
+        append(div);
         scrollToBottom();
         break;
       }
       case 'userMessage':
         addUserMessage(msg.text, msg.image);
         break;
+      case 'step':
+        // A new model request: anything streamed so far belongs to the
+        // previous step, and nothing is visible until the first token.
+        if (currentAssistantEl && currentAssistantBuf) {
+          // The previous step ended in prose without a tool call or a final
+          // answer (a retry, a failed test run). Keep what it said; start
+          // the next step's text in a bubble of its own.
+          currentAssistantEl = null;
+          currentAssistantBuf = '';
+        }
+        if (!(thinking && !thinking.done)) setWorking('Thinking…');
+        break;
+      case 'thinking':
+        appendThinking(msg.text);
+        break;
       case 'token':
         appendToken(msg.text);
+        break;
+      case 'notice':
+        addSystemNote(msg.text);
         break;
       case 'checkpointCreated': {
         const div = document.createElement('div');
         div.className = 'checkpoint-marker';
         const label = document.createElement('span');
-        label.textContent = `checkpoint \u00b7 ${msg.count} file change${msg.count === 1 ? '' : 's'}`;
+        label.textContent = `checkpoint · ${msg.count} file change${msg.count === 1 ? '' : 's'}`;
         const btn = document.createElement('button');
         btn.textContent = 'Rewind here';
         btn.title = 'Restore files and conversation to just before this turn';
@@ -758,21 +880,35 @@
         };
         div.appendChild(label);
         div.appendChild(btn);
-        messagesEl.appendChild(div);
+        append(div);
         scrollToBottom();
         break;
       }
       case 'rewound':
         restoreSession(msg.messages);
-        addSystemNote(`Rewound \u2014 restored ${msg.paths.length} file(s): ${msg.paths.join(', ') || 'none'}`);
+        addSystemNote(`Rewound — restored ${msg.paths.length} file(s): ${msg.paths.join(', ') || 'none'}`);
+        break;
+      case 'turnReverted':
+        addSystemNote(`Reverted the last turn — restored ${msg.paths.length} file(s): ${msg.paths.join(', ') || 'none'}`);
         break;
       case 'dangerWarning': {
         const block = findToolBlock(msg.id);
         const warn = document.createElement('div');
         warn.className = 'danger-warning';
-        warn.textContent = `\u26a0 Flagged as dangerous: ${msg.why}. This can never be auto-approved.`;
-        (block || messagesEl).appendChild(warn);
+        warn.textContent = `⚠ Flagged as dangerous: ${msg.why}. This can never be auto-approved.`;
+        if (block) block.appendChild(warn);
+        else append(warn);
         scrollToBottom();
+        break;
+      }
+      case 'autoReview': {
+        const block = findToolBlock(msg.id);
+        if (block && msg.reason) {
+          const note = document.createElement('div');
+          note.className = 'tool-body review';
+          note.textContent = `${msg.safe ? 'Auto-approved' : 'Needs your review'}: ${msg.reason}`;
+          block.appendChild(note);
+        }
         break;
       }
       case 'usage':
@@ -783,15 +919,24 @@
         renderSessionStats();
         break;
       case 'toolCall':
-        addToolCall(msg.name, msg.args, msg.id);
+        addToolCall(msg.name, msg.args, msg.id, msg.readOnly);
         sessionStats.toolCalls++;
         renderSessionStats();
         break;
       case 'needsApproval':
-        addApprovalUI(msg.id, msg.name, msg.args, msg.preview, msg.diffId);
+        addApprovalUI(msg.id, msg.name, msg.args, msg.previewError, msg.diffView, msg.diffId);
+        break;
+      case 'approvalCancelled':
+        cancelApproval(msg.id);
         break;
       case 'toolResult':
-        addToolResult(msg.result, msg.isError, msg.id, msg.revertAvailable, msg.diff);
+        addToolResult(msg.result, msg.isError, msg.id, msg.revertAvailable, msg.diffView);
+        break;
+      case 'subTaskCall':
+        addSubTaskLine(`↳ ${msg.name} ${summarizeArgs(msg.name, msg.args)}`);
+        break;
+      case 'subTaskResult':
+        if (msg.isError) addSubTaskLine(`  ✗ ${String(msg.result).slice(0, 200)}`, true);
         break;
       case 'reverted':
         markReverted(msg.id, msg.path);
@@ -802,17 +947,25 @@
         renderSessionStats();
         break;
       case 'error':
-        addSystemNote(`⚠ ${msg.text}`);
+        finishThinking();
+        setWorking(null);
+        if (currentAssistantEl && currentAssistantBuf) renderStreaming();
+        addSystemNote(`⚠ ${msg.text}`, 'error');
         currentAssistantEl = null;
         currentAssistantBuf = '';
+        if (busy) setWorking('Thinking…');
         break;
       case 'busy':
         setBusy(msg.value);
         break;
       case 'cleared':
-        messagesEl.innerHTML = '';
-        currentAssistantEl = null;
-        currentAssistantBuf = '';
+        resetTranscript();
+        sessionStats.toolCalls = 0;
+        sessionStats.totalMs = 0;
+        sessionStats.promptTokens = 0;
+        sessionStats.completionTokens = 0;
+        sessionStats.lastPrompt = 0;
+        renderSessionStats();
         showEmptyState();
         break;
       default:

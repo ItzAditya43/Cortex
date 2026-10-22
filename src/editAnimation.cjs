@@ -15,6 +15,8 @@
 
 'use strict';
 
+const { diffLineArrays } = require('./lineDiff.cjs');
+
 const ZIP_FRAME_MS = 16;
 const ZIP_LINES_PER_FRAME = 8;
 const ZIP_MAX_FRAMES_PER_SPAN = 18;
@@ -32,37 +34,16 @@ const MAX_DIFF_LINES = 3_000; // beyond this the O(n*m) alignment isn't worth it
 
 /**
  * Marks which lines of `after` are unchanged from `before`, via a longest
- * common subsequence over lines.
+ * common subsequence over lines (shared with the chat's diff view).
  * @returns {boolean[]} one flag per line of `after`; true = changed
  */
 function changedLineFlags(beforeLines, afterLines) {
-  const n = beforeLines.length;
-  const m = afterLines.length;
-  if (n * m > MAX_DIFF_LINES * MAX_DIFF_LINES) return afterLines.map(() => true);
-
-  // Standard LCS table over lines.
-  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      dp[i][j] = beforeLines[i] === afterLines[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
-    }
+  if (beforeLines.length * afterLines.length > MAX_DIFF_LINES * MAX_DIFF_LINES) return afterLines.map(() => true);
+  const flags = [];
+  for (const op of diffLineArrays(beforeLines, afterLines)) {
+    if (op.t !== '-') flags.push(op.t === '+');
   }
-
-  const changed = new Array(m).fill(true);
-  let i = 0;
-  let j = 0;
-  while (i < n && j < m) {
-    if (beforeLines[i] === afterLines[j]) {
-      changed[j] = false; // this line survived unchanged
-      i++;
-      j++;
-    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-      i++;
-    } else {
-      j++;
-    }
-  }
-  return changed;
+  return flags;
 }
 
 /** Groups consecutive lines into runs of the same changed/unchanged state. */

@@ -2,12 +2,11 @@
 
 const vscode = require('vscode');
 const crypto = require('crypto');
-const { runTurn } = require('./agentLoop.cjs');
+const { runTurn, parseToolCalls } = require('./agentLoop.cjs');
 const { tools } = require('./tools.cjs');
 const {
   loadHistory,
   saveHistory,
-  resetHistory,
   loadMemoryNotes,
   setMemoryNotes,
   touchSession,
@@ -20,12 +19,13 @@ const { retrieveRelevantNotes } = require('./semanticMemory.cjs');
 const { reviewAction } = require('./approveForMe.cjs');
 const { applyProfile } = require('./profiles.cjs');
 const { generateProjectRules } = require('./initRules.cjs');
-const { saveSnapshot, loadSnapshots, deleteSnapshot, clearSession, pruneOldSessions } = require('./checkpoints.cjs');
+const { saveSnapshot, loadSnapshots, deleteSnapshot, clearSession, pruneOldSessions, restoreSnapshot } = require('./checkpoints.cjs');
 const { clearTasks } = require('./taskList.cjs');
 const { markAgentWrite, getStaleWarning } = require('./fileTracker.cjs');
 const audit = require('./auditLog.cjs');
 const { buildEditAnimation } = require('./editAnimation.cjs');
 const logger = require('./logger.cjs');
+const { buildDiffView } = require('./lineDiff.cjs');
 
 const MUTATING_TOOLS = Object.entries(tools)
   .filter(([, t]) => t.confirm)
@@ -40,38 +40,65 @@ const ICON_MEMORY = `<svg ${ICON_SVG_ATTRS}><ellipse cx="12" cy="5" rx="9" ry="3
 const ICON_HISTORY = `<svg ${ICON_SVG_ATTRS}><circle cx="12" cy="12" r="9"></circle><polyline points="12 7 12 12 16 14"></polyline></svg>`;
 const ICON_APPROVALS = `<svg ${ICON_SVG_ATTRS}><polyline points="8 11 11 14 17 6"></polyline><path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"></path></svg>`;
 
+// The chat card's view of a change: hunks per file plus totals. multi_edit
+// snapshots carry one entry per file; everything else is a single file.
+function diffViewFor(change) {
+  if (!change || change.error || change.before === undefined) return null;
+  const entries = Array.isArray(change.files) ? change.files : [change];
+  let add = 0;
+  let del = 0;
+  const files = entries.map((f) => {
+    const v = buildDiffView(f.before, f.after);
+    add += v.add;
+    del += v.del;
+    return { path: f.path, hunks: v.hunks, truncated: v.truncated, created: !!f.created };
+  });
+  return { files, add, del, renamed: change.renameFrom ? `${change.renameFrom} → ${change.renameTo}` : null };
+}
+
 function nonce() {
   return crypto.randomBytes(16).toString('hex');
 }
 
-// Turn the raw model-facing history (which includes literal TOOL_CALL:/
-// TOOL_RESULT: protocol text) back into something presentable when a past
-// session is resumed — we don't reconstruct full diff cards, just a
-// readable trace of what happened.
+// Turns the raw model-facing history (literal TOOL_CALL:/TOOL_RESULT:
+// protocol text) back into what the panel showed when the chat was live: the
+// user's messages, the model's prose, and a tool card per call with its
+// result. Protocol-internal messages (format nudges, retries) are left out —
+// they were never shown the first time either.
 function simplifyHistoryForDisplay(history) {
   const out = [];
+  let awaiting = null; // tool cards from the last TOOL_CALL message, waiting for their result
   for (const msg of history) {
+    const content = String(msg.content || '');
     if (msg.role === 'user') {
-      if (msg.content.startsWith('TOOL_RESULT:')) {
-        out.push({ role: 'system', text: msg.content.replace(/^TOOL_RESULT:\s*/, 'Tool result: ').slice(0, 300) });
+      if (content.startsWith('TOOL_RESULT:')) {
+        const result = content.replace(/^TOOL_RESULT:\s*/, '');
+        if (awaiting && awaiting.length) {
+          const card = awaiting[awaiting.length - 1];
+          card.result = result.length > 4000 ? `${result.slice(0, 4000)}\n…` : result;
+          card.isError = /^(ERROR|User declined)/.test(result);
+          awaiting = null;
+        } else if (/^SYSTEM NOTE/.test(result)) {
+          out.push({ role: 'system', text: result.replace(/^SYSTEM NOTE\s*[—-]\s*/, '').slice(0, 300) });
+        }
+      } else if (content.startsWith('[Earlier conversation summary]')) {
+        out.push({ role: 'system', text: 'Earlier conversation was compacted into a summary.' });
       } else {
-        out.push({ role: 'user', text: msg.content });
+        out.push({ role: 'user', text: content });
       }
     } else if (msg.role === 'assistant') {
-      const idx = msg.content.indexOf('TOOL_CALL:');
-      if (idx !== -1) {
-        let label = msg.content.slice(idx);
-        try {
-          const start = label.indexOf('{');
-          const obj = JSON.parse(label.slice(start));
-          label = `Called tool: ${obj.name}`;
-        } catch {
-          label = 'Called a tool';
-        }
-        out.push({ role: 'system', text: label });
-      } else {
-        out.push({ role: 'assistant', text: msg.content });
+      const idx = content.indexOf('TOOL_CALL:');
+      if (idx === -1) {
+        out.push({ role: 'assistant', text: content });
+        continue;
       }
+      const commentary = content.slice(0, idx).trim();
+      if (commentary) out.push({ role: 'assistant', text: commentary });
+      const calls = parseToolCalls(content).filter((c) => c.ok);
+      awaiting = calls.length
+        ? calls.map((c) => /** @type {{role: string, name: string, args: object, result?: string, isError?: boolean}} */ ({ role: 'tool', name: c.data.name, args: c.data.arguments || {} }))
+        : [{ role: 'tool', name: 'tool call', args: {} }];
+      out.push(...awaiting);
     }
   }
   return out;
@@ -116,6 +143,7 @@ class ChatViewProvider {
       temperature: c.get('temperature'),
       maxSteps: c.get('maxSteps'),
       contextBudgetTokens: c.get('contextBudgetTokens'),
+      numCtx: c.get('numCtx') || 0,
       webhookUrl: c.get('webhookUrl') || '',
       sandboxMode: c.get('sandboxMode') || (c.get('sandboxCommands') ? 'workspace-write' : 'danger-full-access'),
       sandboxAllowNetwork: !!c.get('sandboxAllowNetwork'),
@@ -163,6 +191,7 @@ class ChatViewProvider {
   renderHtml(webview) {
     const nonceVal = nonce();
     const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'main.js'));
+    const renderUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'render.js'));
     const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(this.context.extensionUri, 'media', 'main.css'));
     const cfg = this.cfg();
     return `<!DOCTYPE html>
@@ -202,7 +231,7 @@ class ChatViewProvider {
     <textarea id="input" placeholder="Ask Cortex to do something in this workspace..." rows="3"></textarea>
     <div id="composer-row">
       <button id="attach-btn" title="Attach an image (vision model required)" aria-label="Attach image">📎</button>
-      <span id="model-badge">${escapeHtml(cfg.model)}</span>
+      <button id="model-badge" title="Switch model">${escapeHtml(cfg.model)}</button>
       <span id="session-stats" title="This session: tool calls / total time"></span>
       <span class="spacer"></span>
       <button id="stop-btn" class="hidden">Stop</button>
@@ -210,6 +239,7 @@ class ChatViewProvider {
     </div>
   </div>
 </div>
+<script nonce="${nonceVal}" src="${renderUri}"></script>
 <script nonce="${nonceVal}" src="${scriptUri}"></script>
 </body>
 </html>`;
@@ -240,13 +270,7 @@ class ChatViewProvider {
         await this.onSend(msg.text, msg.image);
         break;
       case 'stop':
-        this.abortController?.abort();
-        // Hard recovery: if the flag is set but nothing is actually running
-        // (a turn that threw during setup), aborting alone would leave the
-        // UI dead. Stop always returns the panel to a usable state.
-        this.busy = false;
-        this.abortController = null;
-        this.post({ type: 'busy', value: false });
+        this.cancelTurn();
         break;
       case 'approve':
         this.resolveApproval(msg.id, msg.approved);
@@ -321,12 +345,33 @@ class ChatViewProvider {
       case 'revertTurn':
         await this.revertLastTurn();
         break;
+      case 'copy':
+        if (typeof msg.text === 'string') await vscode.env.clipboard.writeText(msg.text);
+        break;
       case 'openExternal':
         if (msg.url) vscode.env.openExternal(vscode.Uri.parse(msg.url));
         break;
       default:
         break;
     }
+  }
+
+  // Ends the running turn, if any, and returns the panel to a usable state.
+  // Open approval cards are resolved as declined: left pending, the turn
+  // stayed parked on them forever, and a later click on Approve ran the
+  // action anyway — after the user had pressed Stop.
+  cancelTurn() {
+    this.abortController?.abort();
+    for (const [id, resolve] of this.pendingApprovals) {
+      resolve(false);
+      this.post({ type: 'approvalCancelled', id });
+    }
+    this.pendingApprovals.clear();
+    // Hard recovery: if the flag is set but nothing is actually running (a
+    // turn that threw during setup), aborting alone would leave the UI dead.
+    this.busy = false;
+    this.abortController = null;
+    this.post({ type: 'busy', value: false });
   }
 
   sendSessions() {
@@ -342,6 +387,7 @@ class ChatViewProvider {
   forkSession() {
     const root = this.root;
     if (!root) return;
+    if (this.busy) this.cancelTurn();
     const forkedId = nonce().slice(0, 8);
     const historyCopy = JSON.parse(JSON.stringify(this.history));
     saveHistory(root, forkedId, historyCopy);
@@ -358,7 +404,10 @@ class ChatViewProvider {
   loadSession(id) {
     const root = this.root;
     if (!root) return;
-    this.abortController?.abort();
+    // The running turn holds a reference to the old history array and saves
+    // it under this.sessionId when it ends — it has to stop first, or it
+    // writes the old conversation into the session just opened.
+    if (this.busy) this.cancelTurn();
     this.sessionId = id;
     this.history = loadHistory(root, id);
     this.restoreCheckpoints();
@@ -375,7 +424,7 @@ class ChatViewProvider {
     this.checkpoints = [];
     const byTurn = new Map();
     for (const snap of loadSnapshots(root, this.sessionId)) {
-      this.revertable.set(snap.callId, { path: snap.path, before: snap.before });
+      this.revertable.set(snap.callId, snap);
       const turnId = snap.turnId || snap.callId;
       if (!byTurn.has(turnId)) byTurn.set(turnId, { id: turnId, callIds: [], at: snap.at });
       byTurn.get(turnId).callIds.push(snap.callId);
@@ -383,11 +432,17 @@ class ChatViewProvider {
     this.checkpoints = [...byTurn.values()].sort((a, b) => a.at - b.at);
   }
 
-  newChat() {
+  // Starts a fresh conversation. The previous one stays in History — New
+  // Chat used to delete it from disk, so the History panel listed a chat
+  // that opened empty. Only /clear (discard: true) throws it away.
+  newChat({ discard = false } = {}) {
     const root = this.root;
+    if (this.busy) this.cancelTurn();
     if (root) {
-      resetHistory(root, this.sessionId);
-      clearSession(root, this.sessionId);
+      if (discard) {
+        deleteSession(root, this.sessionId);
+        clearSession(root, this.sessionId);
+      }
       clearTasks(root); // a new chat is a new task — don't inherit the old checklist
       pruneOldSessions(root);
     }
@@ -415,12 +470,20 @@ class ChatViewProvider {
       this.pendingApprovals.set(id, resolve);
       const preview = tools[name].preview ? safePreview(tools[name], args, this.root) : null;
       let diffId = null;
-      if (preview && preview.before !== undefined) {
+      if (preview && preview.before !== undefined && !preview.files && !preview.renameFrom) {
         diffId = id;
         this.diffProvider.store(diffId, preview);
-        this.diffShownFor.add(id);
       }
-      this.post({ type: 'needsApproval', id, name, args, preview, diffId });
+      if (preview && preview.before !== undefined) this.diffShownFor.add(id);
+      this.post({
+        type: 'needsApproval',
+        id,
+        name,
+        args,
+        previewError: preview?.error || null,
+        diffView: diffViewFor(preview),
+        diffId,
+      });
     });
   }
 
@@ -477,12 +540,12 @@ class ChatViewProvider {
     const snapshot = this.revertable.get(callId);
     if (!root || !snapshot) return;
     try {
-      tools.write_file.run({ path: snapshot.path, content: snapshot.before }, root);
+      const paths = restoreSnapshot(root, snapshot);
       this.revertable.delete(callId);
       deleteSnapshot(root, this.sessionId, callId);
       this.history.push({
         role: 'user',
-        content: `TOOL_RESULT: SYSTEM NOTE — the user manually reverted your change to ${snapshot.path} back to its previous contents. Take this into account if you continue working.`,
+        content: `TOOL_RESULT: SYSTEM NOTE — the user manually reverted your change to ${paths.join(', ')} back to its previous state. Take this into account if you continue working.`,
       });
       saveHistory(root, this.sessionId, this.history);
       this.post({ type: 'reverted', id: callId, path: snapshot.path });
@@ -509,7 +572,7 @@ class ChatViewProvider {
 
     switch (cmd) {
       case 'clear':
-        this.newChat();
+        this.newChat({ discard: true });
         return true;
 
       case 'compact':
@@ -651,6 +714,15 @@ class ChatViewProvider {
   // The body of a turn. Split out so onSend's finally always runs, whatever
   // happens in here.
   async runTurnForMessage(text, image, root) {
+    // Pinned for the whole turn: if the user switches chats mid-turn, the
+    // turn must finish writing into the conversation it belongs to.
+    const sessionId = this.sessionId;
+    const history = this.history;
+    // Once the user has moved to another chat, this turn's events belong to
+    // a conversation that is no longer on screen.
+    const post = (msg) => {
+      if (this.sessionId === sessionId) this.post(msg);
+    };
 
     // Ollama's /api/chat accepts an `images` field (base64, no data: prefix)
     // on a message for vision-capable models (llava, qwen2.5-vl, etc.) —
@@ -659,11 +731,11 @@ class ChatViewProvider {
     // the pipeline to carry it through.
     const userMsg = { role: 'user', content: text || '(see attached image)' };
     if (image) userMsg.images = [image.replace(/^data:[^,]+,/, '')];
-    this.history.push(userMsg);
+    history.push(userMsg);
 
     const cfg = this.cfg();
     logger.log(
-      `session=${this.sessionId} mode=${this.mode} model=${cfg.model} user message (${(text || '').length} chars${image ? ' + image' : ''}): ${(text || '').slice(0, 120)}`
+      `session=${sessionId} mode=${this.mode} model=${cfg.model} user message (${(text || '').length} chars${image ? ' + image' : ''}): ${(text || '').slice(0, 120)}`
     );
     let memoryNotes = loadMemoryNotes(root);
     if (cfg.provider !== 'openai-compatible') {
@@ -688,8 +760,9 @@ class ChatViewProvider {
     const planMode = this.mode === 'plan';
     const startedAt = Date.now();
     const turnCallIds = [];
+    const callInfo = new Map(); // callId -> {name, args, autoApproved}
     audit.turnStarted(root, {
-      sessionId: this.sessionId,
+      sessionId,
       model: cfg.model,
       prompt: text,
       mode: this.mode,
@@ -701,11 +774,11 @@ class ChatViewProvider {
     // Remember where this turn begins so a later rewind can cut the
     // conversation back to exactly this point.
     this.turnStartIndexes = this.turnStartIndexes || {};
-    this.turnStartIndexes[turnId] = this.history.length - 1;
+    this.turnStartIndexes[turnId] = history.length - 1;
 
     try {
       await runTurn({
-        history: this.history,
+        history,
         root,
         host: cfg.host,
         provider: cfg.provider,
@@ -714,10 +787,11 @@ class ChatViewProvider {
         fastModel: cfg.fastModel,
         escalateModel: cfg.escalateModel,
         testCommand: cfg.testCommand,
-        onTestRun: (cmd, result, failed) => this.post({ type: 'testRun', command: cmd, result, failed }),
+        onTestRun: (cmd, result, failed) => post({ type: 'testRun', command: cmd, result, failed }),
         temperature: cfg.temperature,
         maxSteps: cfg.maxSteps,
         contextBudgetTokens: cfg.contextBudgetTokens,
+        numCtx: cfg.numCtx,
         memoryNotes,
         openFile,
         selection,
@@ -739,20 +813,29 @@ class ChatViewProvider {
             maxSteps: cfg.maxSteps,
             contextBudgetTokens: cfg.contextBudgetTokens,
           },
-          onSubTaskEvent: (kind, payload) => this.post({ type: `subTask${kind === 'toolCall' ? 'Call' : 'Result'}`, ...payload }),
+          onSubTaskEvent: (kind, payload) => post({ type: `subTask${kind === 'toolCall' ? 'Call' : 'Result'}`, ...payload }),
         },
         onLog: (message) => logger.log(message),
         onToken: (t) => {
-          this.post({ type: 'token', text: t });
+          post({ type: 'token', text: t });
+        },
+        onThinking: (t) => {
+          post({ type: 'thinking', text: t });
+        },
+        onStep: (step, model) => {
+          post({ type: 'step', step, model });
+        },
+        onRecovery: (_kind, message) => {
+          post({ type: 'notice', text: message });
         },
         onUsage: (u) => {
-          this.post({ type: 'usage', ...u, contextBudget: cfg.contextBudgetTokens });
+          post({ type: 'usage', ...u, contextBudget: cfg.contextBudgetTokens });
         },
         onToolCall: (name, args, callId) => {
-          this.lastToolName = name;
-          this.lastToolArgs = args;
-          this.lastToolAutoApproved = undefined;
-          this.post({ type: 'toolCall', name, args, id: callId });
+          // Keyed by call: parallel read batches report results out of order,
+          // so "the last tool called" mislabelled them in the audit log.
+          callInfo.set(callId, { name, args, autoApproved: undefined });
+          post({ type: 'toolCall', name, args, id: callId, readOnly: !!tools[name]?.readOnly });
         },
         requestApproval: async (name, args, callId) => {
           if (
@@ -766,7 +849,7 @@ class ChatViewProvider {
               toolKind: tools[name]?.kind,
             })
           ) {
-            this.lastToolAutoApproved = true;
+            if (callInfo.has(callId)) callInfo.get(callId).autoApproved = true;
             return true;
           }
           // Reaching here with a dangerous command means the safety floor
@@ -776,8 +859,8 @@ class ChatViewProvider {
             const { classifyCommand } = require('./dangerousCommands.cjs');
             const risk = classifyCommand(args.command);
             if (risk.dangerous) {
-              audit.blocked(root, { sessionId: this.sessionId, tool: name, reason: risk.why, detail: `${args.command} — ${risk.why}` });
-              this.post({ type: 'dangerWarning', id: callId, why: risk.why });
+              audit.blocked(root, { sessionId, tool: name, reason: risk.why, detail: `${args.command} — ${risk.why}` });
+              post({ type: 'dangerWarning', id: callId, why: risk.why });
             }
           }
           if (cfg.approveForMe) {
@@ -787,59 +870,60 @@ class ChatViewProvider {
               args,
               text
             );
-            this.post({ type: 'autoReview', id: callId, safe: review.safe, reason: review.reason });
+            post({ type: 'autoReview', id: callId, safe: review.safe, reason: review.reason });
             if (review.safe) return true;
           }
           return this.requestApproval(name, args, callId);
         },
         onToolResult: (result, isError, callId, snapshot) => {
+          const info = (callId && callInfo.get(callId)) || {};
           audit.toolRan(root, {
-            sessionId: this.sessionId,
-            tool: this.lastToolName,
-            args: this.lastToolArgs,
-            approved: this.lastToolAutoApproved,
+            sessionId,
+            tool: info.name,
+            args: info.args,
+            approved: info.autoApproved,
             isError,
             resultPreview: result,
           });
           if (snapshot) {
-            audit.fileChanged(root, { sessionId: this.sessionId, file: snapshot.path, before: snapshot.before, after: snapshot.after });
+            audit.fileChanged(root, { sessionId, file: snapshot.path, before: snapshot.before, after: snapshot.after });
           }
           if (snapshot && callId) {
             this.revertable.set(callId, snapshot);
             turnCallIds.push(callId);
-            saveSnapshot(root, this.sessionId, callId, snapshot, turnId);
+            saveSnapshot(root, sessionId, callId, snapshot, turnId);
           }
           const alreadyShown = callId && this.diffShownFor.has(callId);
-          this.post({
+          post({
             type: 'toolResult',
             result,
             isError,
             id: callId,
             revertAvailable: !!snapshot,
-            diff: !alreadyShown && snapshot ? { path: snapshot.path, before: snapshot.before, after: snapshot.after } : null,
+            diffView: !alreadyShown && snapshot ? diffViewFor(snapshot) : null,
           });
           // Live preview: pop the diff for every successful file write/edit
           // straight into the editor pane as it happens, instead of making
           // the user hunt for it in the chat panel afterwards.
-          if (snapshot && callId && !isError) this.showDiffLive(snapshot, callId);
+          if (snapshot && callId && !isError && !snapshot.files && !snapshot.renameFrom) this.showDiffLive(snapshot, callId);
         },
         onFinal: (finalText, steps) => {
-          this.post({ type: 'final', text: finalText, steps, elapsedMs: Date.now() - startedAt });
+          post({ type: 'final', text: finalText, steps, elapsedMs: Date.now() - startedAt });
         },
         onError: (message) => {
-          this.post({ type: 'error', text: message });
+          post({ type: 'error', text: message });
         },
       });
     } catch (err) {
-      this.post({ type: 'error', text: err.message });
+      post({ type: 'error', text: err.message });
     } finally {
       if (turnCallIds.length > 0) {
         this.checkpoints = this.checkpoints || [];
         this.checkpoints.push({ id: turnId, callIds: turnCallIds, at: Date.now() });
-        this.post({ type: 'checkpointCreated', id: turnId, callIds: turnCallIds, count: turnCallIds.length });
+        post({ type: 'checkpointCreated', id: turnId, callIds: turnCallIds, count: turnCallIds.length });
       }
-      saveHistory(root, this.sessionId, this.history);
-      touchSession(root, this.sessionId, this.history);
+      saveHistory(root, sessionId, history);
+      touchSession(root, sessionId, history);
     }
   }
 
@@ -865,8 +949,7 @@ class ChatViewProvider {
         const snap = this.revertable.get(callId);
         if (!snap) continue;
         try {
-          tools.write_file.run({ path: snap.path, content: snap.before }, root);
-          restored.add(snap.path);
+          for (const p of restoreSnapshot(root, snap)) restored.add(p);
           this.revertable.delete(callId);
           deleteSnapshot(root, this.sessionId, callId);
         } catch (err) {
@@ -898,13 +981,14 @@ class ChatViewProvider {
     if (!root || !this.checkpoints || this.checkpoints.length === 0) return;
     const cp = this.checkpoints.pop();
     const seen = new Set();
+    // Newest first, so a file changed twice ends at its state from before
+    // the turn rather than from between the two changes.
     for (let i = cp.callIds.length - 1; i >= 0; i--) {
       const callId = cp.callIds[i];
       const snapshot = this.revertable.get(callId);
-      if (!snapshot || seen.has(snapshot.path)) continue;
-      seen.add(snapshot.path);
+      if (!snapshot) continue;
       try {
-        tools.write_file.run({ path: snapshot.path, content: snapshot.before }, root);
+        for (const p of restoreSnapshot(root, snapshot)) seen.add(p);
         this.revertable.delete(callId);
         deleteSnapshot(root, this.sessionId, callId);
       } catch (err) {
@@ -968,6 +1052,9 @@ class DiffContentProvider {
    * Plays the edit as a top-down sweep over the virtual document, so the
    * change is watched rather than just appearing. The file on disk is never
    * touched by this — the write already happened, or happens after.
+   * @param {string} id
+   * @param {{path: string, before?: string, after?: string}} snapshot
+   * @param {{onFrame?: (frame: {content: string, activeLine: number}) => void}} [opts]
    */
   async animate(id, snapshot, { onFrame } = {}) {
     if (this.animating_.has(id)) return;
@@ -999,4 +1086,4 @@ class DiffContentProvider {
   }
 }
 
-module.exports = { ChatViewProvider, DiffContentProvider, listModels };
+module.exports = { ChatViewProvider, DiffContentProvider, listModels, simplifyHistoryForDisplay, diffViewFor };

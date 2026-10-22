@@ -101,13 +101,13 @@ function makeMockVscode() {
 }
 
 // Inject the mock so `require('vscode')` resolves inside the extension.
-const originalResolve = Module._resolveFilename;
+const originalResolve = /** @type {any} */ (Module)._resolveFilename;
 const MOCK_ID = path.join(__dirname, '__vscode_mock__.js');
-Module._resolveFilename = function (request, ...args) {
+/** @type {any} */ (Module)._resolveFilename = function (request, ...args) {
   if (request === 'vscode') return MOCK_ID;
   return originalResolve.call(this, request, ...args);
 };
-require.cache[MOCK_ID] = { id: MOCK_ID, filename: MOCK_ID, loaded: true, exports: makeMockVscode() };
+require.cache[MOCK_ID] = /** @type {any} */ ({ id: MOCK_ID, filename: MOCK_ID, loaded: true, exports: makeMockVscode() });
 
 const extension = require('../src/extension.cjs');
 

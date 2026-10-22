@@ -83,8 +83,9 @@ an editor:
 
 | Layer | Files | Depends on `vscode`? |
 |---|---|---|
-| Core | `agentLoop.cjs`, `ollamaClient.cjs`, `tools.cjs`, `memory.cjs`, `systemPrompt.cjs`, `contextManager.cjs`, `permissions.cjs` | No |
-| Host | `extension.cjs`, `chatViewProvider.cjs`, `logger.cjs` | Yes |
+| Core | `agentLoop.cjs`, `ollamaClient.cjs`, `tools.cjs`, `memory.cjs`, `systemPrompt.cjs`, `contextManager.cjs`, `permissions.cjs`, `checkpoints.cjs`, `lineDiff.cjs`, `sandbox.cjs` | No |
+| Host | `extension.cjs`, `chatViewProvider.cjs`, `terminal.cjs`, `lsp.cjs`, `logger.cjs` | Yes |
+| Webview | `media/render.js` (pure, unit-tested), `media/main.js`, `media/main.css` | — |
 
 Notable pieces:
 - **`contextManager.cjs`** — replaces naive "keep the last N messages" history
@@ -136,10 +137,16 @@ before it touches anything, unless auto-approve is on.
 | Setting | Default | Description |
 |---|---|---|
 | `cortex.host` | `http://localhost:11434` | Ollama server URL |
-| `cortex.model` | `qwen2.5-coder` | Model to use |
-| `cortex.autoApprove` | `false` | Skip confirmation for file writes/edits/commands |
+| `cortex.model` | `qwen2.5-coder:3b` | Model to use (click the model name under the chat box to switch) |
+| `cortex.approvalPolicy` | `untrusted` | `untrusted` asks before every change, `on-request` auto-approves sandboxed changes, `never` never asks |
+| `cortex.autoApprove` | `false` | Skip confirmation for file writes/edits/commands (dangerous commands still ask) |
+| `cortex.contextBudgetTokens` | `6000` | How much conversation is sent per step |
+| `cortex.numCtx` | `0` (auto) | Context window Ollama loads the model with; auto = budget + room for the reply, min 8192 |
 | `cortex.temperature` | `0.2` | Sampling temperature |
 | `cortex.maxSteps` | `25` | Max tool-call steps per request |
+
+Everything else (fast/escalation models, sandboxing, MCP servers, profiles,
+schedules) is under **Settings → Extensions → Cortex**.
 
 ## Commands
 
@@ -152,13 +159,21 @@ before it touches anything, unless auto-approve is on.
 
 | Tool | Approval required? | Purpose |
 |---|---|---|
-| `read_file` | no | read a file with line numbers |
+| `read_file` | no | read one or several files with line numbers |
 | `list_dir` | no | list a directory (non-recursive) |
-| `search_code` | no | grep-style search across the workspace |
+| `search_code` | no | extended-regex search across the workspace (falls back to literal text) |
+| `find_symbol` / `find_references` | no | definitions and usages, via the language server when available |
+| `diagnostics` | no | the editor's real compiler/linter errors |
+| `edit_file` / `multi_edit` | yes (diff shown) | replace exact snippets, in one file or atomically across several |
 | `write_file` | yes (diff shown) | create a file or overwrite one fully |
-| `edit_file` | yes (diff shown) | replace one exact, unique snippet of text |
-| `run_command` | yes | run a shell command in the workspace root |
-| `remember` | no | append a durable note to long-term memory |
+| `delete_file` / `rename_file` | yes | delete or move a file |
+| `run_command` | yes | run a shell command in the workspace root (Stop kills it) |
+| `run_background` | yes | start a dev server / watcher and poll its output |
+| `git_status` / `git_diff` / `git_commit` | commit only | inspect and commit changes |
+| `save_plan`, `remember`, `read_url`, `delegate_task` | no | plan tracking, memory, web fetch, sub-agents |
+
+Tools that can't work in the current setup (no webhook configured, no code
+index built, no language server) are left out of the model's prompt.
 
 All file paths are sandboxed to the current workspace root — tools refuse to
 read/write outside of it.
@@ -189,7 +204,7 @@ the model is at instruction-following and code.
 git clone <this repo>
 cd cortex
 npm install
-npm test               # run the unit tests
+npm test               # run the unit tests (includes the chat panel, via jsdom)
 npm run typecheck       # static type-check via tsc --noEmit (checkJs)
 npm run package         # produces cortex-<version>.vsix
 ```
@@ -213,8 +228,8 @@ for you):
 
 1. Create a publisher at https://marketplace.visualstudio.com/manage —
    note the publisher id.
-2. Set `"publisher"` in [package.json](package.json) to that id (it currently
-   says `cortex` as a placeholder).
+2. Make sure `"publisher"` in [package.json](package.json) matches that id
+   (currently `ItzAditya43`).
 3. Create an Azure DevOps Personal Access Token with **Marketplace: Manage**
    scope, per https://code.visualstudio.com/api/working-with-extensions/publishing-extension#get-a-personal-access-token
 4. `npx vsce login <publisher-id>` and paste the token, then:
@@ -225,21 +240,21 @@ for you):
 
 ## Known limitations
 
-- Tool-calling is prompt-based (one call per model turn), not Ollama's native
-  function calling — most reliable with the "coder" family of models.
-- No parallel tool calls; the agent always executes one step at a time.
-- Resuming a past chat from History replays a simplified transcript (tool
-  calls collapse to one-line notes rather than full diff cards) — the
-  underlying context sent to the model is exact, only the on-screen replay
-  is summarized.
-- Revert restores a file's exact previous contents; it isn't a full git-style
-  checkpoint of the whole workspace, and only covers `write_file`/`edit_file`
-  (not `run_command` side effects).
-- `run_command` executes synchronously via a child process, not VS Code's
-  integrated terminal, and is capped at 60s.
-- Local models have small context windows; tool results are truncated to
-  ~8000 chars and history capped at the last 200 messages, but very long
-  sessions on small-context models may still benefit from "New Chat".
+- Tool-calling is prompt-based (a `TOOL_CALL:` line), not Ollama's native
+  function calling — it works with any model, but small models (≤3B) still
+  make mistakes on multi-file tasks. A 7B+ coder model or a cloud model is
+  noticeably more reliable.
+- Only read-only tool calls run in parallel; every change is applied one at
+  a time so each gets its own approval, diff and undo point.
+- A resumed chat replays tool calls as collapsed cards with their results,
+  but not the original diffs.
+- Revert covers file changes made through Cortex's tools (edits, writes,
+  creates, deletes, renames) — not side effects of shell commands.
+- `run_command` uses the integrated terminal when shell integration is
+  available, otherwise a background process; either way it's capped at
+  120s — use `run_background` for servers and watchers.
+- Long sessions on small context windows get trimmed (oldest steps first,
+  the original request is always kept); `/compact` or "New Chat" helps.
 
 ## License
 

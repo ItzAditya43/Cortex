@@ -28,8 +28,11 @@ test('buildContextMessages drops oldest messages and inserts a notice when over 
   // truncation eats the replaceable middle instead of the goal
   assert.strictEqual(messages[1].content, history[0].content);
   assert.match(messages[2].content, /SYSTEM NOTE.*omitted/);
-  // the most recent message must always survive
-  assert.strictEqual(messages[messages.length - 1].content, history[2].content);
+  // the most recent message must always survive — clipped to what is left of
+  // the budget rather than sent oversized
+  const last = messages[messages.length - 1].content;
+  assert.ok(last.startsWith('ccc') && last.endsWith('ccc'), 'most recent message survives');
+  assert.ok(estimateTokens(last) < 1000, 'and is clipped to fit, not sent whole');
 });
 
 test('buildContextMessages anchors the original task even when tool noise fills the budget', () => {
@@ -46,7 +49,24 @@ test('buildContextMessages always keeps at least the most recent message even if
   const history = [{ role: 'user', content: 'x'.repeat(100000) }];
   const messages = buildContextMessages('sys', history, 10);
   assert.strictEqual(messages.length, 2);
-  assert.strictEqual(messages[1].content, history[0].content);
+  assert.ok(messages[1].content.startsWith('xxxx'), 'the message is kept, not dropped');
+});
+
+test('an oversized tool result is clipped to the budget instead of sent whole', () => {
+  // Sent unclipped, the server truncates the prompt itself — from the front,
+  // which takes the system prompt and the task with it.
+  const history = [
+    { role: 'user', content: 'TASK: fix the bug' },
+    { role: 'assistant', content: 'TOOL_CALL: {"name":"read_file","arguments":{"path":"big.js"}}' },
+    { role: 'user', content: `TOOL_RESULT:\nHEAD${'y'.repeat(200000)}TAIL` },
+  ];
+  const messages = buildContextMessages('sys', history, 6000);
+  const total = messages.reduce((n, m) => n + estimateTokens(m.content), 0);
+  assert.ok(total <= 6200, `prompt must fit the budget, got ~${total} tokens`);
+  const last = messages[messages.length - 1].content;
+  assert.ok(last.startsWith('TOOL_RESULT:\nHEAD') && last.endsWith('TAIL'), 'head and tail survive');
+  assert.match(last, /characters omitted/);
+  assert.ok(messages.some((m) => m.content === 'TASK: fix the bug'), 'the task is still there');
 });
 
 test('estimateTokens is a rough chars/4 heuristic', () => {

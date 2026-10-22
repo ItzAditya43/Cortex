@@ -25,8 +25,17 @@ Set `cortex.model` to something capable first. Check the Output panel
 - [ ] Ask: *"list the files here"* → tool card appears with a clean header,
       **not** raw `TOOL_CALL: {...}` JSON text
 - [ ] Ask it to create a file → approval prompt appears with a diff
-- [ ] Approve → file is actually created on disk
+- [ ] Approve → file is actually created on disk, and the card shows
+      `OK: wrote …` plus a **↩ Revert this change** button
+- [ ] Revert it → the file is **gone** (not left behind empty)
+- [ ] Ask it to run `sleep 30` → approve → press **Stop** → the command dies
+      within a second and VS Code stays responsive meanwhile
+- [ ] Ask for another edit, press **Stop** while the approval card is open →
+      the card says *Cancelled* and nothing is written
+- [ ] While the model works, a *Thinking… / Running …* line is always visible
 - [ ] **The chat panel scrolls** (send enough messages to overflow)
+- [ ] New Chat, then open History → the previous chat is listed **and opens
+      with its messages**
 
 ## 2. Live diff in the editor  *(new, unverified)*
 - [ ] After an approved edit, a diff opens automatically in the main editor area

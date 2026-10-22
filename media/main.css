@@ -293,6 +293,10 @@ body {
   gap: 12px;
   scrollbar-width: thin;
 }
+/* Flex items shrink by default, and an item with overflow: hidden (the tool
+   cards) may shrink to nothing — once the transcript outgrew the panel,
+   cards were squashed into slivers instead of the list scrolling. */
+#messages > * { flex-shrink: 0; }
 #messages::-webkit-scrollbar { width: 8px; }
 #messages::-webkit-scrollbar-thumb {
   background: color-mix(in srgb, var(--vscode-foreground) 20%, transparent);
@@ -376,6 +380,83 @@ body {
   white-space: pre;
 }
 .md-link { color: var(--cortex-accent); cursor: pointer; text-decoration: underline; }
+.code-wrap { margin: 8px 0; }
+.code-wrap .md-code { margin: 0; border-top-left-radius: 0; border-top-right-radius: 0; }
+.code-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 6px 2px 10px;
+  font-size: 10.5px;
+  color: var(--vscode-descriptionForeground);
+  background: var(--vscode-textCodeBlock-background, rgba(128,128,128,0.1));
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+  border-bottom: none;
+  border-radius: var(--cortex-radius-sm) var(--cortex-radius-sm) 0 0;
+}
+.copy-btn {
+  border: none;
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  font-size: 10.5px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.copy-btn:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15)); }
+.md-table { border-collapse: collapse; margin: 6px 0 10px; font-size: 12px; display: block; overflow-x: auto; }
+.md-table th, .md-table td {
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+  padding: 3px 8px;
+  text-align: left;
+}
+.md-table th { background: var(--vscode-sideBarSectionHeader-background, rgba(128,128,128,0.08)); }
+.md-quote {
+  margin: 6px 0;
+  padding: 2px 10px;
+  border-left: 3px solid var(--vscode-textBlockQuote-border, rgba(128,128,128,0.4));
+  color: var(--vscode-descriptionForeground);
+}
+.md-hr { border: none; border-top: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); margin: 10px 0; }
+.md-task { list-style: none; margin-left: -16px; }
+
+/* ---------- working indicator / thinking ---------- */
+.working {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  padding: 2px 4px;
+}
+.working .working-time { opacity: 0.7; font-variant-numeric: tabular-nums; }
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--cortex-accent);
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.thinking {
+  font-size: 12px;
+  color: var(--vscode-descriptionForeground);
+  border-left: 2px solid color-mix(in srgb, var(--cortex-accent-2) 60%, transparent);
+  padding: 2px 0 2px 10px;
+}
+.thinking summary { cursor: pointer; user-select: none; font-style: italic; }
+.thinking-body {
+  white-space: pre-wrap;
+  margin-top: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.msg.system.error { color: var(--vscode-errorForeground); font-style: normal; align-self: stretch; text-align: left; }
 
 .turn-stats {
   font-size: 10px;
@@ -455,9 +536,58 @@ body {
 .revert-btn:hover { text-decoration: underline; }
 .revert-btn:disabled { opacity: 0.6; cursor: default; text-decoration: none; }
 
-.diff-line { display: block; padding: 1px 6px; border-radius: 3px; }
+.tool-body.diff { padding: 4px 0; white-space: pre; overflow-x: auto; max-height: 320px; }
+.diff-line { display: block; padding: 0 10px 0 4px; min-width: max-content; }
+.diff-sign { display: inline-block; width: 14px; opacity: 0.7; user-select: none; }
+.diff-ctx { opacity: 0.75; }
 .diff-add { background: rgba(63, 185, 80, 0.16); }
-.diff-del { background: rgba(248, 81, 73, 0.14); text-decoration: line-through; opacity: 0.85; }
+.diff-del { background: rgba(248, 81, 73, 0.14); }
+.diff-gap, .diff-note {
+  padding: 2px 10px;
+  font-size: 11px;
+  color: var(--vscode-descriptionForeground);
+  font-style: italic;
+}
+.diff-file {
+  padding: 4px 10px 2px;
+  font-weight: 700;
+  font-size: 11.5px;
+  border-top: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+}
+.diff-file:first-child { border-top: none; }
+.diff-new {
+  font-weight: 500;
+  font-size: 10px;
+  color: #3fb950;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  padding: 0 5px;
+  margin-left: 4px;
+}
+.tool-body.command { color: var(--vscode-foreground); font-weight: 500; }
+.tool-body.review, .tool-body.subtask-log { color: var(--vscode-descriptionForeground); font-size: 11.5px; }
+.tool-body.subtask-log .error { color: var(--vscode-errorForeground); }
+
+.tool-header .status { font-size: 11px; flex-shrink: 0; font-family: var(--vscode-font-family); }
+.tool-header .status.ok { color: #3fb950; }
+.tool-header .status.error { color: var(--vscode-errorForeground); }
+.tool-header .status.waiting {
+  color: #d29922;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  padding: 0 7px;
+}
+.tool-header .status.running::before {
+  content: '';
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid var(--cortex-accent);
+  border-right-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: -1px;
+}
 
 .approval-row {
   display: flex;
@@ -558,14 +688,20 @@ body {
   margin-top: 8px;
 }
 
-#model-badge {
+#composer #model-badge {
   font-size: 11px;
   font-weight: 500;
   color: var(--vscode-descriptionForeground);
   background: var(--vscode-badge-background, rgba(128,128,128,0.15));
   padding: 3px 9px;
   border-radius: 999px;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+#composer #model-badge:hover { color: var(--vscode-foreground); }
+#composer #model-badge::after { content: ' ▾'; opacity: 0.6; }
 
 .spacer { flex: 1; }
 
@@ -596,6 +732,18 @@ body {
   font-size: 11.5px;
   line-height: 1.5;
 }
+.empty-examples { display: flex; flex-direction: column; gap: 6px; margin-top: 14px; }
+.empty-examples .example {
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+  background: var(--vscode-editor-background);
+  color: var(--vscode-foreground);
+  border-radius: var(--cortex-radius-sm);
+  padding: 6px 10px;
+  font-size: 11.5px;
+  cursor: pointer;
+  text-align: left;
+}
+.empty-examples .example:hover { border-color: var(--cortex-accent); }
 
 .typing-cursor::after {
   content: '▍';

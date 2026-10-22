@@ -62,7 +62,7 @@ async function chat({ host, apiKey, model, messages, temperature = 0.2, onToken,
   }
 
   if (!res.body) {
-    const data = await res.json();
+    const data = /** @type {any} */ (await res.json());
     const content = data.choices?.[0]?.message?.content ?? '';
     if (onToken && content) onToken(content);
     return content;
@@ -104,11 +104,12 @@ async function chat({ host, apiKey, model, messages, temperature = 0.2, onToken,
  * @returns {Promise<Array<{name: string, size: number}>>}
  */
 async function listModels({ host, apiKey }) {
+  /** @type {Record<string, string>} */
   const headers = {};
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  const res = await fetch(`${host.replace(/\/$/, '')}/v1/models`, { headers });
+  const res = await fetch(`${host.replace(/\/$/, '')}/v1/models`, { headers, signal: AbortSignal.timeout(10_000) });
   if (!res.ok) throw new Error(`Failed to list models from ${host} (HTTP ${res.status})`);
-  const data = await res.json();
+  const data = /** @type {any} */ (await res.json());
   return (data.data || []).map((m) => ({ name: m.id, size: 0 }));
 }
 

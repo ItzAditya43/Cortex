@@ -56,6 +56,7 @@ function walk(dir, root, out = []) {
 
 // Overlapping line windows: a function split across a boundary still has one
 // chunk containing enough of it to match.
+/** @returns {Array<{path: string, startLine: number, endLine: number, text: string, vector?: number[]}>} */
 function chunkFile(root, relPath) {
   let text;
   try {
@@ -82,7 +83,7 @@ async function embed(host, model, text) {
     signal: AbortSignal.timeout(30_000),
   });
   if (!res.ok) throw new Error(`embeddings HTTP ${res.status}`);
-  const data = await res.json();
+  const data = /** @type {any} */ (await res.json());
   if (!Array.isArray(data.embedding)) throw new Error('no embedding returned');
   return data.embedding;
 }
@@ -111,7 +112,8 @@ function loadIndex(root) {
  * Builds/refreshes the index. Files whose mtime is unchanged since the last
  * build keep their existing vectors, so re-indexing a large repo after a few
  * edits costs a few embeds rather than thousands.
- * @param {(done: number, total: number) => void} [onProgress]
+ * @param {string} root
+ * @param {{host?: string, model?: string, onProgress?: (done: number, total: number) => void}} [opts]
  */
 async function buildIndex(root, { host, model = EMBED_MODEL_DEFAULT, onProgress } = {}) {
   const files = walk(root, root);
@@ -162,7 +164,10 @@ async function buildIndex(root, { host, model = EMBED_MODEL_DEFAULT, onProgress 
 }
 
 /**
- * @returns {Promise<Array<{path, startLine, endLine, text, score}>>}
+ * @param {string} root
+ * @param {string} query
+ * @param {{host?: string, model?: string, topK?: number}} [opts]
+ * @returns {Promise<Array<{path: string, startLine: number, endLine: number, text: string, score: number}>|null>}
  */
 async function search(root, query, { host, model = EMBED_MODEL_DEFAULT, topK = 8 } = {}) {
   const index = loadIndex(root);

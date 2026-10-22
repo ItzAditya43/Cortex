@@ -18,7 +18,7 @@ const { probeModel, PROBES } = require('../src/modelProbe.cjs');
 function listen(handler) {
   return new Promise((resolve) => {
     const server = http.createServer(handler);
-    server.listen(0, () => resolve({ server, port: server.address().port }));
+    server.listen(0, () => resolve({ server, port: /** @type {import('net').AddressInfo} */ (server.address()).port }));
   });
 }
 

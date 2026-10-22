@@ -44,7 +44,7 @@ async function embed({ host, model = EMBED_MODEL_DEFAULT, text }) {
     signal: AbortSignal.timeout(20_000),
   });
   if (!res.ok) throw new Error(`embeddings HTTP ${res.status}`);
-  const data = await res.json();
+  const data = /** @type {any} */ (await res.json());
   if (!Array.isArray(data.embedding)) throw new Error('no embedding in response');
   return data.embedding;
 }

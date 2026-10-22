@@ -119,9 +119,44 @@ function emit(opts, obj, humanLine) {
   else if (humanLine) console.log(humanLine);
 }
 
-async function runOnce(opts, text, history) {
-  return new Promise((resolve) => {
-    runTurn({
+// Prints the model's prose as it streams, minus the TOOL_CALL protocol text
+// (the "> tool(...)" line stands in for it), so the terminal isn't silent
+// for the whole of a long generation.
+function makeStreamPrinter() {
+  let buf = '';
+  let printed = 0;
+  let hidden = false;
+  return {
+    token(t) {
+      if (hidden) return;
+      buf += t;
+      const idx = buf.indexOf('TOOL_CALL:');
+      // hold back a possible partial marker at the end
+      const safeEnd = idx !== -1 ? idx : Math.max(printed, buf.length - 'TOOL_CALL:'.length);
+      if (safeEnd > printed) {
+        process.stdout.write(buf.slice(printed, safeEnd));
+        printed = safeEnd;
+      }
+      if (idx !== -1) hidden = true;
+    },
+    // end of a model response: flush what is left, return whether anything was shown
+    end() {
+      if (!hidden && buf.length > printed) process.stdout.write(buf.slice(printed));
+      const shown = buf.slice(0, hidden ? buf.indexOf('TOOL_CALL:') : buf.length).trim().length > 0;
+      if (shown) process.stdout.write('\n');
+      buf = '';
+      printed = 0;
+      hidden = false;
+      return shown;
+    },
+  };
+}
+
+async function runOnce(opts, text, history, { ask, signal } = {}) {
+  const stream = opts.json ? null : makeStreamPrinter();
+  let streamedFinal = false;
+  try {
+    await runTurn({
       history,
       root: opts.root,
       host: opts.host,
@@ -134,9 +169,14 @@ async function runOnce(opts, text, history) {
       contextBudgetTokens: opts.contextBudgetTokens,
       memoryNotes: loadMemoryNotes(opts.root),
       planMode: false,
+      signal,
       ctx: { host: opts.host, sandboxMode: opts.sandboxMode, sandboxAllowNetwork: opts.sandboxAllowNetwork },
-      onToken: () => {},
-      onToolCall: (name, args) => emit(opts, { type: 'toolCall', name, args }, `> ${name}(${JSON.stringify(args)})`),
+      onStep: () => stream?.end(),
+      onToken: (t) => stream?.token(t),
+      onToolCall: (name, args) => {
+        stream?.end();
+        emit(opts, { type: 'toolCall', name, args }, `> ${name}(${JSON.stringify(args).slice(0, 300)})`);
+      },
       requestApproval: async (name, args) => {
         if (opts.autoApprove) return true;
         if (opts.approveForMe) {
@@ -149,10 +189,8 @@ async function runOnce(opts, text, history) {
           emit(opts, { type: 'autoReview', name, safe: review.safe, reason: review.reason }, `  ~ auto-review: ${review.safe ? 'SAFE' : 'needs human'} — ${review.reason}`);
           if (review.safe) return true;
         }
-        if (!opts.json) {
-          const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-          const answer = await new Promise((res) => rl.question(`Approve ${name}(${JSON.stringify(args)})? [y/N] `, res));
-          rl.close();
+        if (!opts.json && ask) {
+          const answer = await ask(`Approve ${name}(${JSON.stringify(args).slice(0, 300)})? [y/N] `);
           return /^y/i.test(answer);
         }
         return false; // no interactive approval in --json/CI mode; use --auto-approve instead
@@ -160,15 +198,25 @@ async function runOnce(opts, text, history) {
       onToolResult: (result, isError) =>
         emit(opts, { type: 'toolResult', result, isError }, isError ? `  ! ${result}` : `  = ${result.slice(0, 200)}`),
       onFinal: (finalText) => {
-        emit(opts, { type: 'final', text: finalText }, finalText);
-        resolve();
+        streamedFinal = stream ? stream.end() : false;
+        // already on screen if it streamed; print it only when it didn't
+        emit(opts, { type: 'final', text: finalText }, streamedFinal ? null : finalText);
       },
       onError: (message) => {
+        stream?.end();
         emit(opts, { type: 'error', message }, `Error: ${message}`);
-        resolve();
       },
     });
-  });
+  } catch (err) {
+    stream?.end();
+    emit(opts, { type: 'error', message: err.message }, `Error: ${err.message}`);
+  }
+  if (signal?.aborted) emit(opts, { type: 'cancelled' }, '(cancelled)');
+}
+
+/** One readline for the whole session — a second one on the same stdin echoes every keystroke twice. */
+function makeAsk(rl) {
+  return (question) => new Promise((res) => rl.question(question, res));
 }
 
 async function main() {
@@ -176,22 +224,37 @@ async function main() {
 
   if (opts.prompt) {
     const history = [{ role: 'user', content: opts.prompt }];
-    await runOnce(opts, opts.prompt, history);
+    const rl = opts.json || !process.stdin.isTTY ? null : readline.createInterface({ input: process.stdin, output: process.stdout });
+    const controller = new AbortController();
+    process.once('SIGINT', () => controller.abort());
+    await runOnce(opts, opts.prompt, history, { ask: rl ? makeAsk(rl) : undefined, signal: controller.signal });
+    rl?.close();
     return;
   }
 
   console.log(`Cortex CLI — ${opts.model} via ${opts.host} (${opts.provider}). Working dir: ${opts.root}`);
-  console.log('Type a request, or Ctrl+C to exit.\n');
+  console.log('Type a request. Ctrl+C cancels a running request; Ctrl+C at the prompt exits.\n');
   const history = [];
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: '> ' });
+  let running = null; // AbortController of the turn in progress
+  rl.on('SIGINT', () => {
+    if (running) running.abort();
+    else {
+      rl.close();
+      process.exit(0);
+    }
+  });
   rl.prompt();
   rl.on('line', async (line) => {
+    if (running) return; // input while a turn runs is an approval answer, handled by rl.question
     if (!line.trim()) {
       rl.prompt();
       return;
     }
     history.push({ role: 'user', content: line });
-    await runOnce(opts, line, history);
+    running = new AbortController();
+    await runOnce(opts, line, history, { ask: makeAsk(rl), signal: running.signal });
+    running = null;
     rl.prompt();
   });
 }

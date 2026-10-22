@@ -23,7 +23,7 @@ const Module = require('module');
 const MOCK_ID = path.join(__dirname, '__vscode_busy_mock__.js');
 if (!require.cache[MOCK_ID]) {
   const Disposable = { dispose() {} };
-  require.cache[MOCK_ID] = {
+  require.cache[MOCK_ID] = /** @type {any} */ ({
     id: MOCK_ID,
     filename: MOCK_ID,
     loaded: true,
@@ -48,9 +48,9 @@ if (!require.cache[MOCK_ID]) {
       languages: { getDiagnostics: () => [] },
       env: { openExternal: async () => {} },
     },
-  };
-  const originalResolve = Module._resolveFilename;
-  Module._resolveFilename = function (request, ...args) {
+  });
+  const originalResolve = /** @type {any} */ (Module)._resolveFilename;
+  /** @type {any} */ (Module)._resolveFilename = function (request, ...args) {
     if (request === 'vscode') return MOCK_ID;
     return originalResolve.call(this, request, ...args);
   };
@@ -122,4 +122,19 @@ test('a reloaded webview is told the real busy state', async () => {
   const busy = posted.filter((m) => m.type === 'busy');
   assert.ok(busy.length > 0, 'ready must report the busy state');
   assert.strictEqual(busy.at(-1).value, true, 'a reloaded panel must not assume it is idle');
+});
+
+test('Stop resolves an open approval as declined and retires its card', async () => {
+  const { provider, posted } = makeProvider();
+  provider.busy = true;
+  provider.abortController = new AbortController();
+  const pending = provider.requestApproval('run_command', { command: 'echo hi' }, 'call-1');
+
+  await provider.handleMessage({ type: 'stop' });
+
+  assert.strictEqual(await pending, false, 'the turn waiting on this approval must be released, as a decline');
+  assert.ok(posted.some((m) => m.type === 'approvalCancelled' && m.id === 'call-1'), 'the card must stop offering Approve');
+  // A late click on the stale card must not resurrect anything.
+  provider.resolveApproval('call-1', true);
+  assert.strictEqual(provider.pendingApprovals.size, 0);
 });
