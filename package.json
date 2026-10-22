@@ -220,6 +220,21 @@
           "default": "qwen2.5-coder:3b",
           "description": "Ollama model to use for the agent — must exactly match a locally pulled model name/tag (see `ollama list`)."
         },
+        "cortex.toolCalling": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "native",
+            "text"
+          ],
+          "default": "auto",
+          "enumDescriptions": [
+            "Native tool calling when Ollama reports the model supports it, otherwise the text protocol",
+            "Always use Ollama's native tool calling",
+            "Always use the TOOL_CALL text protocol (works with any model)"
+          ],
+          "description": "How tools are offered to the model. Native tool calling (Ollama's tools API) is more reliable on models trained for it and keeps the prompt shorter; the text protocol works with every model. Ignored for openai-compatible providers, which always use the text protocol."
+        },
         "cortex.autoApprove": {
           "type": "boolean",
           "default": false,

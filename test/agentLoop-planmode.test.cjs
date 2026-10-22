@@ -41,6 +41,7 @@ test('plan mode blocks write_file and reports it back to the model, not the file
     await runTurn({
       history,
       root,
+      toolCalling: 'text',
       host: 'http://fake',
       model: 'fake',
       temperature: 0.2,
@@ -78,6 +79,7 @@ test('act mode (planMode: false) actually runs write_file', async () => {
     await runTurn({
       history,
       root,
+      toolCalling: 'text',
       host: 'http://fake',
       model: 'fake',
       temperature: 0.2,

@@ -83,3 +83,11 @@ test('diff view html marks added and removed lines', () => {
   assert.match(html, /diff-del"><span class="diff-sign">-<\/span>b/);
   assert.match(html, /diff-add"><span class="diff-sign">\+<\/span>&lt;c&gt;/);
 });
+
+test('a tool call written as a JSON object does not flash on screen', () => {
+  const r = R.splitStreamingReply('```json\n{"name": "edit_file", "argu');
+  assert.strictEqual(r.text, '');
+  assert.strictEqual(r.toolName, 'edit_file');
+  assert.strictEqual(R.splitStreamingReply('```json\n').text, '', 'nor does the fence before the object arrives');
+  assert.match(R.splitStreamingReply('Use `{"name": 1}` like this').text, /Use/, 'prose that merely mentions JSON is untouched');
+});

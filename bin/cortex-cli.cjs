@@ -13,6 +13,7 @@ const os = require('os');
 const path = require('path');
 const readline = require('readline');
 const { runTurn } = require('../src/agentLoop.cjs');
+const { expandMentions } = require('../src/mentions.cjs');
 const { loadMemoryNotes } = require('../src/memory.cjs');
 const { reviewAction } = require('../src/approveForMe.cjs');
 const { applyProfile } = require('../src/profiles.cjs');
@@ -50,6 +51,7 @@ function parseArgs(argv) {
     temperature: fileCfg.temperature ?? 0.2,
     maxSteps: fileCfg.maxSteps ?? 25,
     contextBudgetTokens: fileCfg.contextBudgetTokens ?? 6000,
+    toolCalling: fileCfg.toolCalling || 'auto',
     autoApprove: !!fileCfg.autoApprove,
     sandboxMode: fileCfg.sandboxMode || 'danger-full-access',
     sandboxAllowNetwork: !!fileCfg.sandboxAllowNetwork,
@@ -73,6 +75,7 @@ function parseArgs(argv) {
     else if (a === '--profile') opts.profile = argv[++i];
     else if (a === '--json') opts.json = true;
     else if (a === '--max-steps') opts.maxSteps = parseInt(argv[++i], 10);
+    else if (a === '--tool-calling') opts.toolCalling = argv[++i]; // auto | native | text
     else if (a === '--help' || a === '-h') {
       printHelp();
       process.exit(0);
@@ -105,6 +108,7 @@ Flags:
   --approve-for-me          auto-review pending approvals with a model call instead of asking interactively
   --profile <name>          apply a named preset from the "profiles" key in .cortex/config.json (project) or ~/.cortex/config.json (user)
   --max-steps <n>           max tool-call steps per turn (default: 25)
+  --tool-calling <mode>     auto | native | text — how tools are offered to the model (default: auto)
   --json                    emit one JSON object per line instead of human-readable output
 
 Config file (optional, both fully optional): ~/.cortex/config.json then ./.cortex/config.json (project overrides user).
@@ -167,6 +171,7 @@ async function runOnce(opts, text, history, { ask, signal } = {}) {
       temperature: opts.temperature,
       maxSteps: opts.maxSteps,
       contextBudgetTokens: opts.contextBudgetTokens,
+      toolCalling: opts.toolCalling,
       memoryNotes: loadMemoryNotes(opts.root),
       planMode: false,
       signal,
@@ -223,7 +228,7 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
 
   if (opts.prompt) {
-    const history = [{ role: 'user', content: opts.prompt }];
+    const history = [{ role: 'user', content: expandMentions(opts.prompt, opts.root).content }];
     const rl = opts.json || !process.stdin.isTTY ? null : readline.createInterface({ input: process.stdin, output: process.stdout });
     const controller = new AbortController();
     process.once('SIGINT', () => controller.abort());
@@ -251,7 +256,9 @@ async function main() {
       rl.prompt();
       return;
     }
-    history.push({ role: 'user', content: line });
+    const mentioned = expandMentions(line, opts.root);
+    if (mentioned.attached.length) console.log(`  (attached ${mentioned.attached.join(', ')})`);
+    history.push({ role: 'user', content: mentioned.content });
     running = new AbortController();
     await runOnce(opts, line, history, { ask: makeAsk(rl), signal: running.signal });
     running = null;

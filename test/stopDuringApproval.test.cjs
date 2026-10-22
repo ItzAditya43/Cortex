@@ -24,6 +24,7 @@ test('an approval granted after Stop does not run the tool', async () => {
     await runTurn({
       history: [{ role: 'user', content: 'make a.txt' }],
       root,
+      toolCalling: 'text',
       host: 'http://fake',
       model: 'fake',
       temperature: 0,

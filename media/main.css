@@ -811,3 +811,67 @@ body {
 #jump-bottom:hover { border-color: var(--cortex-accent); color: var(--cortex-accent); }
 #jump-bottom.hidden { display: none; }
 #app { position: relative; }
+
+/* ---------- @-mention menu ---------- */
+#composer { position: relative; }
+#mention-menu {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: calc(100% - 4px);
+  max-height: 260px;
+  overflow-y: auto;
+  background: var(--vscode-editorSuggestWidget-background, var(--vscode-editor-background));
+  border: 1px solid var(--vscode-editorSuggestWidget-border, var(--vscode-widget-border, var(--vscode-panel-border)));
+  border-radius: var(--cortex-radius-sm);
+  box-shadow: var(--cortex-shadow);
+  z-index: 10;
+  padding: 3px;
+}
+.mention-item {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.mention-item.active, .mention-item:hover {
+  background: var(--vscode-editorSuggestWidget-selectedBackground, var(--vscode-list-activeSelectionBackground, rgba(128,128,128,0.2)));
+}
+.mention-base { font-weight: 600; }
+.mention-dir { color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+.mention-empty { padding: 4px 8px; font-size: 12px; color: var(--vscode-descriptionForeground); }
+
+/* ---------- last-message actions & attachments ---------- */
+.msg-actions {
+  align-self: flex-end;
+  display: flex;
+  gap: 4px;
+  margin-top: -8px;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+#messages:hover .msg-actions { opacity: 0.85; }
+#messages.busy .msg-actions { display: none; }
+.msg-actions button {
+  border: none;
+  background: transparent;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.msg-actions button:hover { color: var(--vscode-foreground); background: var(--vscode-toolbar-hoverBackground, rgba(128,128,128,0.15)); }
+.attached-row { align-self: flex-end; display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; margin-top: -6px; max-width: 88%; }
+.attached-chip {
+  font-size: 10.5px;
+  color: var(--vscode-descriptionForeground);
+  border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border));
+  border-radius: 999px;
+  padding: 1px 8px;
+}

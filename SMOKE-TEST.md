@@ -36,6 +36,12 @@ Set `cortex.model` to something capable first. Check the Output panel
 - [ ] **The chat panel scrolls** (send enough messages to overflow)
 - [ ] New Chat, then open History → the previous chat is listed **and opens
       with its messages**
+- [ ] Type `@` and part of a file name → a file list appears; Enter inserts
+      `@path`, and after sending, a 📎 chip shows the file was attached
+- [ ] After a turn that edited a file, hover your message → **↻ Retry** undoes
+      the edit and runs the message again; **✎ Edit** puts it back in the box
+- [ ] With a tool-capable 7B+ or cloud model, the Output channel says
+      `native tools`; with a 3B model it says `text tools`
 
 ## 2. Live diff in the editor  *(new, unverified)*
 - [ ] After an approved edit, a diff opens automatically in the main editor area

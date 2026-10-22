@@ -71,6 +71,7 @@ async function runSchedule(schedule, { root, runConfig, onResult, onError, logFn
       temperature: runConfig.temperature,
       maxSteps: runConfig.maxSteps,
       contextBudgetTokens: runConfig.contextBudgetTokens,
+      toolCalling: runConfig.toolCalling,
       memoryNotes: '',
       // Unattended runs default to read-only (Plan Mode) unless the schedule
       // explicitly opts into autoApprove — nobody's watching to click approve.

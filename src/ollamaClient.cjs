@@ -63,12 +63,14 @@ function stalledError(ms) {
  * @param {number} [opts.numCtx]        context window to request (see numCtxFor)
  * @param {(chunk: string) => void} [opts.onToken] called with each incremental token as it streams in
  * @param {(chunk: string) => void} [opts.onThinking] reasoning tokens from thinking models (never part of the reply)
+ * @param {Array<object>} [opts.tools]   native tool definitions; when given, calls arrive through onToolCalls
+ * @param {(calls: Array<{function: {name: string, arguments: object}}>) => void} [opts.onToolCalls]
  * @param {(usage: {promptTokens: number, completionTokens: number, totalDurationMs: number}) => void} [opts.onUsage]
  * @param {AbortSignal} [opts.signal]
  * @param {(message: string) => void} [opts.logFn] optional diagnostic sink — never throws, never required
  * @returns {Promise<string>} the full assistant message content
  */
-async function chat({ host, model, messages, temperature = 0.2, numCtx, onToken, onThinking, onUsage, signal, logFn }) {
+async function chat({ host, model, messages, temperature = 0.2, numCtx, tools, onToolCalls, onToken, onThinking, onUsage, signal, logFn }) {
   // Idle watchdog: if the model stalls mid-generation (no bytes for 90s —
   // common with an overloaded/hung local model), abort instead of hanging
   // the whole turn forever with the UI stuck on "busy" and no way out.
@@ -105,7 +107,7 @@ async function chat({ host, model, messages, temperature = 0.2, numCtx, onToken,
         res = await fetch(`${host}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model, messages, stream: true, options }),
+          body: JSON.stringify({ model, messages, stream: true, options, ...(tools && tools.length ? { tools } : {}) }),
           signal: idleController.signal,
         });
         connectErr = null;
@@ -135,8 +137,9 @@ async function chat({ host, model, messages, temperature = 0.2, numCtx, onToken,
     }
 
     if (!res.body) {
-      const data = /** @type {{message?: {content?: string}}} */ (await res.json());
+      const data = /** @type {{message?: {content?: string, tool_calls?: any[]}}} */ (await res.json());
       const content = data.message?.content ?? '';
+      if (data.message?.tool_calls?.length) onToolCalls?.(data.message.tool_calls);
       if (onToken && content) onToken(content);
       logFn?.(`response ${content.length} chars (non-streaming)`);
       return content;
@@ -168,6 +171,8 @@ async function chat({ host, model, messages, temperature = 0.2, numCtx, onToken,
           // reasoning separately and send empty content meanwhile. Ignoring
           // it left the panel blank for as long as the model thought.
           if (obj.message?.thinking && onThinking) onThinking(obj.message.thinking);
+          // Native tool calls arrive whole, in their own chunk.
+          if (obj.message?.tool_calls?.length) onToolCalls?.(obj.message.tool_calls);
           if (obj.message?.content) {
             full += obj.message.content;
             if (onToken) onToken(obj.message.content);
@@ -217,4 +222,48 @@ async function listModels({ host }) {
   return (data.models || []).map((m) => ({ name: m.name, size: m.size }));
 }
 
-module.exports = { chat, listModels, numCtxFor };
+const capabilityCache = new Map(); // `${host}|${model}` -> Promise<{capabilities: string[], paramsB: number|null}>
+
+// "3.1B", "567M", or a raw count (cloud models report 32682372656).
+function parseParamSize(v) {
+  if (typeof v === 'number') return v > 1e6 ? v / 1e9 : v;
+  const m = String(v || '').trim().match(/^([\d.]+)\s*([KMBT]?)$/i);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  const unit = m[2].toUpperCase();
+  if (!unit) return n > 1e6 ? n / 1e9 : null;
+  return n * { K: 1e-6, M: 1e-3, B: 1, T: 1e3 }[unit];
+}
+
+/**
+ * What a model can do ("tools", "thinking", "vision", ...) and its size in
+ * billions of parameters, from Ollama's /api/show. Cached per host+model;
+ * an unreachable server or unknown model yields no capabilities rather than
+ * an error.
+ * @param {{host: string, model: string}} opts
+ * @returns {Promise<{capabilities: string[], paramsB: number|null}>}
+ */
+function modelInfo({ host, model }) {
+  const key = `${host}|${model}`;
+  if (!capabilityCache.has(key)) {
+    const lookup = fetch(`${host}/api/show`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model }),
+      signal: AbortSignal.timeout(10_000),
+    })
+      .then((res) => (res.ok ? res.json() : /** @type {any} */ ({})))
+      .then((/** @type {any} */ data) => ({
+        capabilities: Array.isArray(data?.capabilities) ? data.capabilities : [],
+        paramsB: parseParamSize(data?.details?.parameter_size),
+      }))
+      .catch(() => {
+        capabilityCache.delete(key); // retry next time instead of caching a transient failure
+        return { capabilities: [], paramsB: null };
+      });
+    capabilityCache.set(key, lookup);
+  }
+  return capabilityCache.get(key);
+}
+
+module.exports = { chat, listModels, numCtxFor, modelInfo, parseParamSize };

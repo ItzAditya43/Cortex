@@ -42,6 +42,13 @@ works as a CI gate.
 ## Features
 
 - **Sidebar chat** — a dedicated "Cortex" view in the Activity Bar.
+- **`@file` mentions** — type `@` in the composer to pick a workspace file;
+  it's attached to your message so the model starts from the code you mean.
+- **Retry / Edit** your last message — the conversation *and* that turn's
+  file changes are rolled back before it runs again.
+- **Native tool calling** — models that support Ollama's tools API (and are
+  big enough to use it well) get real tool schemas; everything else uses a
+  text protocol that works with any model. See `cortex.toolCalling`.
 - **Autonomous tool use** — the agent reads, writes, and edits files, searches
   your codebase, and runs shell commands in a plan → act → observe loop,
   entirely driven by your local model.
@@ -140,6 +147,7 @@ before it touches anything, unless auto-approve is on.
 | `cortex.model` | `qwen2.5-coder:3b` | Model to use (click the model name under the chat box to switch) |
 | `cortex.approvalPolicy` | `untrusted` | `untrusted` asks before every change, `on-request` auto-approves sandboxed changes, `never` never asks |
 | `cortex.autoApprove` | `false` | Skip confirmation for file writes/edits/commands (dangerous commands still ask) |
+| `cortex.toolCalling` | `auto` | `native` (Ollama tools API), `text` (TOOL_CALL protocol), or `auto`: native for tool-capable models of 7B+ |
 | `cortex.contextBudgetTokens` | `6000` | How much conversation is sent per step |
 | `cortex.numCtx` | `0` (auto) | Context window Ollama loads the model with; auto = budget + room for the reply, min 8192 |
 | `cortex.temperature` | `0.2` | Sampling temperature |
@@ -189,10 +197,11 @@ read/write outside of it.
 
 ## Which models work well
 
-Tool-calling is implemented via prompting (a `TOOL_CALL: {...}` line the
-model must emit) rather than Ollama's native function calling, so it works
-with **any** instruct-tuned model — quality of tool use scales with how good
-the model is at instruction-following and code.
+Models that support Ollama's tools API and are 7B or larger are driven
+through native tool calling; everything else gets a text protocol (a
+`TOOL_CALL: {...}` line), so **any** instruct-tuned model works — quality of
+tool use scales with how good the model is at instruction-following and
+code. Force either with `cortex.toolCalling`.
 
 - **Recommended:** `qwen2.5-coder`, `devstral`, `deepseek-coder-v2`
 - **Also solid:** `llama3.1`, `mistral-nemo`, `codestral`
@@ -240,10 +249,10 @@ for you):
 
 ## Known limitations
 
-- Tool-calling is prompt-based (a `TOOL_CALL:` line), not Ollama's native
-  function calling — it works with any model, but small models (≤3B) still
-  make mistakes on multi-file tasks. A 7B+ coder model or a cloud model is
-  noticeably more reliable.
+- Small models (≤4B) still make mistakes on multi-file tasks whichever way
+  tools are offered — qwen2.5-coder:3b passes about 8 of the 12 benchmark
+  tasks. A 7B+ coder model or a cloud model (gemma4:31b-cloud, gpt-oss:120b-cloud
+  pass all 12) is noticeably more reliable.
 - Only read-only tool calls run in parallel; every change is applied one at
   a time so each gets its own approval, diff and undo point.
 - A resumed chat replays tool calls as collapsed cards with their results,

@@ -26,6 +26,7 @@ const audit = require('./auditLog.cjs');
 const { buildEditAnimation } = require('./editAnimation.cjs');
 const logger = require('./logger.cjs');
 const { buildDiffView } = require('./lineDiff.cjs');
+const { workspaceFiles, expandMentions, stripAttachments } = require('./mentions.cjs');
 
 const MUTATING_TOOLS = Object.entries(tools)
   .filter(([, t]) => t.confirm)
@@ -84,7 +85,7 @@ function simplifyHistoryForDisplay(history) {
       } else if (content.startsWith('[Earlier conversation summary]')) {
         out.push({ role: 'system', text: 'Earlier conversation was compacted into a summary.' });
       } else {
-        out.push({ role: 'user', text: content });
+        out.push({ role: 'user', text: stripAttachments(content), image: msg.images?.[0] ? `data:image/png;base64,${msg.images[0]}` : undefined });
       }
     } else if (msg.role === 'assistant') {
       const idx = content.indexOf('TOOL_CALL:');
@@ -144,6 +145,7 @@ class ChatViewProvider {
       maxSteps: c.get('maxSteps'),
       contextBudgetTokens: c.get('contextBudgetTokens'),
       numCtx: c.get('numCtx') || 0,
+      toolCalling: c.get('toolCalling') || 'auto',
       webhookUrl: c.get('webhookUrl') || '',
       sandboxMode: c.get('sandboxMode') || (c.get('sandboxCommands') ? 'workspace-write' : 'danger-full-access'),
       sandboxAllowNetwork: !!c.get('sandboxAllowNetwork'),
@@ -345,6 +347,21 @@ class ChatViewProvider {
       case 'revertTurn':
         await this.revertLastTurn();
         break;
+      case 'retryLast': {
+        const last = this.rewindLastUserMessage();
+        if (last) await this.onSend(last.text, last.image ? `data:image/png;base64,${last.image}` : undefined);
+        break;
+      }
+      case 'editLast': {
+        const last = this.rewindLastUserMessage();
+        if (last) this.post({ type: 'insertText', text: last.text, replace: true });
+        break;
+      }
+      case 'listFiles': {
+        const root = this.root;
+        this.post({ type: 'files', files: root ? workspaceFiles(root) : [] });
+        break;
+      }
       case 'copy':
         if (typeof msg.text === 'string') await vscode.env.clipboard.writeText(msg.text);
         break;
@@ -729,7 +746,12 @@ class ChatViewProvider {
     // history messages pass through buildContextMessages/provider.cjs
     // untouched, so attaching it here is all that's needed for the rest of
     // the pipeline to carry it through.
-    const userMsg = { role: 'user', content: text || '(see attached image)' };
+    // @path mentions attach those files to the message the model sees; the
+    // panel keeps showing what was typed.
+    const mentioned = expandMentions(text || '', root);
+    if (mentioned.attached.length) post({ type: 'attached', paths: mentioned.attached });
+    if (mentioned.missing.length) post({ type: 'notice', text: `Not found, not attached: ${mentioned.missing.join(', ')}` });
+    const userMsg = { role: 'user', content: mentioned.content || '(see attached image)' };
     if (image) userMsg.images = [image.replace(/^data:[^,]+,/, '')];
     history.push(userMsg);
 
@@ -792,6 +814,7 @@ class ChatViewProvider {
         maxSteps: cfg.maxSteps,
         contextBudgetTokens: cfg.contextBudgetTokens,
         numCtx: cfg.numCtx,
+        toolCalling: cfg.toolCalling,
         memoryNotes,
         openFile,
         selection,
@@ -812,6 +835,7 @@ class ChatViewProvider {
             temperature: cfg.temperature,
             maxSteps: cfg.maxSteps,
             contextBudgetTokens: cfg.contextBudgetTokens,
+            toolCalling: cfg.toolCalling,
           },
           onSubTaskEvent: (kind, payload) => post({ type: `subTask${kind === 'toolCall' ? 'Call' : 'Result'}`, ...payload }),
         },
@@ -925,6 +949,52 @@ class ChatViewProvider {
       saveHistory(root, sessionId, history);
       touchSession(root, sessionId, history);
     }
+  }
+
+  // Takes the conversation back to just before the last message the user
+  // sent, undoing the file changes that turn made — the shared first half of
+  // Retry and Edit. Redoing a turn on top of its own half-applied edits would
+  // give the model a workspace that matches neither attempt.
+  // Returns what was sent (text without attachments, raw image), or null.
+  rewindLastUserMessage() {
+    const root = this.root;
+    if (!root || this.busy) return null;
+    let idx = -1;
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      const c = String(this.history[i].content || '');
+      if (this.history[i].role === 'user' && !c.startsWith('TOOL_RESULT') && !c.startsWith('[Earlier conversation summary]')) {
+        idx = i;
+        break;
+      }
+    }
+    if (idx === -1) return null;
+    const msg = this.history[idx];
+
+    const restored = new Set();
+    const starts = this.turnStartIndexes || {};
+    const undone = (this.checkpoints || []).filter((c) => (starts[c.id] ?? -1) >= idx);
+    for (const cp of [...undone].reverse()) {
+      for (const callId of [...cp.callIds].reverse()) {
+        const snap = this.revertable.get(callId);
+        if (!snap) continue;
+        try {
+          for (const p of restoreSnapshot(root, snap)) restored.add(p);
+        } catch (err) {
+          this.post({ type: 'error', text: `Could not undo ${snap.path}: ${err.message}` });
+        }
+        this.revertable.delete(callId);
+        deleteSnapshot(root, this.sessionId, callId);
+      }
+    }
+    this.checkpoints = (this.checkpoints || []).filter((c) => !undone.includes(c));
+    for (const [turnId, start] of Object.entries(starts)) if (start >= idx) delete starts[turnId];
+
+    this.history = this.history.slice(0, idx);
+    saveHistory(root, this.sessionId, this.history);
+    if (this.history.length) touchSession(root, this.sessionId, this.history);
+    this.post({ type: 'restoreSession', id: this.sessionId, messages: simplifyHistoryForDisplay(this.history) });
+    if (restored.size) this.post({ type: 'notice', text: `Undid that turn's changes to ${[...restored].join(', ')}` });
+    return { text: stripAttachments(msg.content), image: msg.images?.[0] };
   }
 
   // Rewinds the session to an earlier checkpoint: restores the files that

@@ -29,6 +29,7 @@ async function startMcpServers(serverConfigs, logFn) {
         registerExternalTool(localName, {
           description: `[MCP:${cfg.name}] ${t.description || t.name}`,
           confirm: true, // external/third-party tools default to requiring approval
+          schema: t.inputSchema, // used when the model is driven through native tool calling
           run: async (args) => {
             try {
               return await callTool(t.name, args);

@@ -19,6 +19,7 @@ const { saveTasks, taskProgress } = require('./taskList.cjs');
 const lsp = require('./lsp.cjs');
 const codeIndex = require('./codeIndex.cjs');
 const terminal = require('./terminal.cjs');
+const { apiToolFor } = require('./toolSchemas.cjs');
 
 // Per-tool output budgets. A single global cap silently cut large file reads
 // mid-function, and the agent then edited against a file it had only half
@@ -591,6 +592,7 @@ const tools = {
         memoryNotes: '',
         planMode: false,
         contextBudgetTokens: ctx.delegateConfig.contextBudgetTokens,
+        toolCalling: ctx.delegateConfig.toolCalling,
         ctx: { ...ctx, delegateDepth: depth + 1 },
         onToken: () => {},
         onToolCall: (name, args, callId) => ctx.onSubTaskEvent?.('toolCall', { name, args, callId }),
@@ -1000,4 +1002,14 @@ function unregisterExternalTool(name) {
   delete tools[name];
 }
 
-module.exports = { tools, toolListForPrompt, isToolAvailable, safePath, registerExternalTool, unregisterExternalTool, runShell };
+/**
+ * The available tools in Ollama's native `tools` format, same order and
+ * same availability rules as the text-protocol list.
+ * @param {{root?: string, ctx?: object}} [opts]
+ */
+function apiToolsFor({ root, ctx } = {}) {
+  const ordered = [...TOOL_GROUPS.flatMap(([, names]) => names), ...Object.keys(tools).filter((n) => !TOOL_GROUPS.some(([, g]) => g.includes(n)))];
+  return [...new Set(ordered)].filter((n) => isToolAvailable(n, root, ctx)).map((n) => apiToolFor(n, tools[n]));
+}
+
+module.exports = { tools, listFiles, toolListForPrompt, apiToolsFor, isToolAvailable, safePath, registerExternalTool, unregisterExternalTool, runShell };

@@ -171,6 +171,11 @@
    */
   function splitStreamingReply(buf) {
     const s = String(buf || '');
+    // A model offered native tools sometimes writes the call as a JSON
+    // object instead; the host recovers it, and it should not flash by.
+    const json = s.match(/^\s*(?:```(?:json)?\s*)?[[{]\s*(?:\{\s*)?"name"\s*:\s*"?([\w.\-]*)/);
+    if (json) return { text: '', toolPending: true, toolName: json[1] || null };
+    if (/^\s*(?:```(?:json)?\s*)?[[{]?\s*$/.test(s) && s.trim()) return { text: '', toolPending: false, toolName: null };
     const idx = s.indexOf(MARKER);
     if (idx !== -1) {
       const m = s.slice(idx).match(/"name"\s*:\s*"([\w.\-]+)"/);
@@ -251,7 +256,55 @@
     return html;
   }
 
+  // ---------- @-mentions ----------
+  /**
+   * Ranks workspace files for the @-mention menu: the file name matching is
+   * worth more than the directory, a prefix more than a substring, and a
+   * scattered subsequence ("chvp" -> chatViewProvider) still counts.
+   * @param {string} query
+   * @param {string[]} files workspace-relative paths
+   * @returns {string[]}
+   */
+  function rankFiles(query, files, limit = 12) {
+    const q = String(query || '').toLowerCase();
+    if (!q) return files.slice().sort((a, b) => a.split('/').length - b.split('/').length || a.length - b.length).slice(0, limit);
+    const scored = [];
+    for (const f of files) {
+      const lower = f.toLowerCase();
+      const base = lower.slice(lower.lastIndexOf('/') + 1);
+      let score = 0;
+      if (base === q) score = 100;
+      else if (base.startsWith(q)) score = 80;
+      else if (base.includes(q)) score = 60;
+      else if (lower.includes(q)) score = 40;
+      else {
+        let i = 0;
+        for (const ch of base) if (ch === q[i]) i++;
+        if (i === q.length) score = 20;
+        else {
+          i = 0;
+          for (const ch of lower) if (ch === q[i]) i++;
+          if (i === q.length) score = 10;
+        }
+      }
+      if (score) scored.push({ f, score: score - f.length / 1000 });
+    }
+    return scored.sort((a, b) => b.score - a.score).slice(0, limit).map((x) => x.f);
+  }
+
+  /**
+   * The @-mention being typed at the cursor, if any.
+   * @returns {{start: number, query: string}|null}
+   */
+  function mentionAt(text, cursor) {
+    const before = String(text).slice(0, cursor);
+    const m = before.match(/(^|\s)@([^\s@]*)$/);
+    return m ? { start: before.length - m[2].length - 1, query: m[2] } : null;
+  }
+
   root.CortexRender = {
+    rankFiles,
+    mentionAt,
     escapeHtml,
     renderInline,
     renderMarkdown,

@@ -194,3 +194,35 @@ test('prose before a tool call survives even when the call arrives before a fram
   assert.match(ui.$('.msg.assistant').textContent, /Checking the config first\./);
   assert.doesNotMatch(ui.$('#messages').textContent, /TOOL_CALL/);
 });
+
+test('typing @ offers workspace files, and Enter inserts the picked one', () => {
+  const ui = openPanel();
+  const input = ui.$('#input');
+  const type = (value) => {
+    input.value = value;
+    input.setSelectionRange(value.length, value.length);
+    input.dispatchEvent(new ui.window.Event('input'));
+  };
+  type('look at @app');
+  assert.ok(ui.sent.some((m) => m.type === 'listFiles'), 'the file list is requested');
+  ui.post({ type: 'files', files: ['src/app.js', 'src/other.js', 'test/app.test.js'] });
+  const items = ui.$$('#mention-menu .mention-item');
+  assert.strictEqual(items[0].textContent, 'app.jssrc/');
+  input.dispatchEvent(new ui.window.KeyboardEvent('keydown', { key: 'Enter' }));
+  assert.strictEqual(input.value, 'look at @src/app.js ');
+  assert.ok(!ui.sent.some((m) => m.type === 'send'), 'Enter picked the file instead of sending');
+  assert.ok(ui.$('#mention-menu').classList.contains('hidden'));
+});
+
+test('the last user message offers Retry and Edit; older ones do not', () => {
+  const ui = openPanel();
+  ui.post({ type: 'userMessage', text: 'one' });
+  ui.post({ type: 'final', text: 'ok', steps: 1, elapsedMs: 10 });
+  ui.post({ type: 'userMessage', text: 'two' });
+  assert.strictEqual(ui.$$('.msg-actions').length, 1);
+  assert.strictEqual(ui.$('.msg-actions').previousElementSibling.textContent, 'two');
+  [...ui.$$('.msg-actions button')].find((b) => /Retry/.test(b.textContent)).click();
+  assert.ok(ui.sent.some((m) => m.type === 'retryLast'));
+  ui.post({ type: 'attached', paths: ['src/app.js'] });
+  assert.match(ui.$('.attached-row').textContent, /src\/app\.js/);
+});

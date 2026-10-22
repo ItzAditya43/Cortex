@@ -71,8 +71,9 @@ function saveSessionsIndex(root, index) {
 // recency-sortable timestamp.
 function touchSession(root, sessionId, history) {
   const index = loadSessionsIndex(root);
+  const { stripAttachments } = require('./mentions.cjs');
   const firstUser = history.find((m) => m.role === 'user');
-  const title = firstUser ? firstUser.content.trim().slice(0, 80) : 'New chat';
+  const title = firstUser ? stripAttachments(firstUser.content).trim().slice(0, 80) || 'New chat' : 'New chat';
   index[sessionId] = { title, updatedAt: new Date().toISOString() };
   saveSessionsIndex(root, index);
 }

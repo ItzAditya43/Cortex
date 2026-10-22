@@ -138,3 +138,46 @@ test('Stop resolves an open approval as declined and retires its card', async ()
   provider.resolveApproval('call-1', true);
   assert.strictEqual(provider.pendingApprovals.size, 0);
 });
+
+test('Retry rewinds to before the last message and undoes that turn\'s file changes', async () => {
+  const fs = require('fs');
+  const os = require('os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-retry-'));
+  fs.writeFileSync(path.join(dir, 'a.js'), 'changed by the turn');
+  const { provider, posted } = makeProvider();
+  Object.defineProperty(provider, 'root', { get: () => dir });
+  provider.history = [
+    { role: 'user', content: 'first request' },
+    { role: 'assistant', content: 'done' },
+    { role: 'user', content: 'make it faster\n\n<attached_files>\n<file path="a.js">x</file>\n</attached_files>' },
+    { role: 'assistant', content: 'TOOL_CALL: {"name":"edit_file","arguments":{"path":"a.js"}}' },
+    { role: 'user', content: 'TOOL_RESULT:\nOK: edited a.js' },
+    { role: 'assistant', content: 'Faster now.' },
+  ];
+  provider.turnStartIndexes = { t2: 2 };
+  provider.checkpoints = [{ id: 't2', callIds: ['c1'], at: 1 }];
+  provider.revertable.set('c1', { path: 'a.js', before: 'original' });
+
+  const sent = [];
+  provider.onSend = async (text) => {
+    sent.push(text);
+  };
+  await provider.handleMessage({ type: 'retryLast' });
+
+  assert.deepStrictEqual(sent, ['make it faster'], 'resent as typed, without the old attachment block');
+  assert.strictEqual(provider.history.length, 2, 'the conversation is back to before that message');
+  assert.strictEqual(fs.readFileSync(path.join(dir, 'a.js'), 'utf8'), 'original', "the turn's edit is undone");
+  assert.ok(posted.some((m) => m.type === 'restoreSession'));
+});
+
+test('Edit puts the last message back in the composer instead of resending', async () => {
+  const { provider, posted } = makeProvider();
+  Object.defineProperty(provider, 'root', { get: () => require('os').tmpdir() });
+  provider.history = [{ role: 'user', content: 'rename foo' }, { role: 'assistant', content: 'ok' }];
+  await provider.handleMessage({ type: 'editLast' });
+  assert.deepStrictEqual(
+    posted.find((m) => m.type === 'insertText'),
+    { type: 'insertText', text: 'rename foo', replace: true }
+  );
+  assert.strictEqual(provider.history.length, 0);
+});

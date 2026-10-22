@@ -4,6 +4,21 @@ All notable changes to Cortex are documented here.
 
 ## [Unreleased]
 
+### Added (late October 2026)
+- **Native tool calling.** Models that support Ollama's tools API get real
+  tool schemas instead of a hand-written TOOL_CALL protocol (shorter prompt,
+  no JSON escaping by hand). `cortex.toolCalling: auto` uses it for
+  tool-capable models of 7B+ — measured: gemma4:31b-cloud and
+  gpt-oss:120b-cloud pass 12/12 natively, while qwen2.5-coder:3b drops from
+  8/12 to 5/12, so small models stay on the text protocol. A call a model
+  writes as JSON text instead is still recognised. History is stored in one
+  format either way, so checkpoints, rewind and replay are unaffected.
+- **`@file` mentions** in the composer, with a fuzzy file picker (arrow keys,
+  Enter/Tab). Mentioned files are attached to the message; the CLI accepts
+  them too.
+- **Retry and Edit** on the last message, rolling back the conversation and
+  that turn's file changes first.
+
 ### Fixed (October 2026)
 - **Approved actions now show their result.** With the default "ask me"
   approval, the output of an approved command, the edit confirmation and the

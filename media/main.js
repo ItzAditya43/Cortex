@@ -1,6 +1,6 @@
 (function () {
   const vscode = acquireVsCodeApi();
-  const { escapeHtml, renderMarkdown, splitStreamingReply, summarizeArgs, diffViewHtml } = window.CortexRender;
+  const { escapeHtml, renderMarkdown, splitStreamingReply, summarizeArgs, diffViewHtml, rankFiles, mentionAt } = window.CortexRender;
 
   const messagesEl = document.getElementById('messages');
   const inputEl = document.getElementById('input');
@@ -178,10 +178,37 @@
       div.appendChild(span);
     }
     append(div);
+    markLastUserMessage();
     currentAssistantEl = null;
     currentAssistantBuf = '';
     thinking = null;
     scrollToBottom(true); // sending is an explicit request to see the newest message
+  }
+
+  // Retry / Edit live on the most recent message the user sent, and only
+  // there: going further back is what checkpoints' "Rewind here" is for.
+  function markLastUserMessage() {
+    messagesEl.querySelectorAll('.msg-actions').forEach((el) => el.remove());
+    const users = messagesEl.querySelectorAll('.msg.user');
+    const last = users[users.length - 1];
+    if (!last) return;
+    const bar = document.createElement('div');
+    bar.className = 'msg-actions';
+    bar.innerHTML =
+      '<button data-act="editLast" title="Edit this message and resend (undoes this turn\'s file changes)">✎ Edit</button>' +
+      '<button data-act="retryLast" title="Run this message again (undoes this turn\'s file changes)">↻ Retry</button>';
+    bar.querySelectorAll('button').forEach((b) => b.addEventListener('click', () => !busy && vscode.postMessage({ type: b.dataset.act })));
+    last.insertAdjacentElement('afterend', bar);
+  }
+
+  function addAttachedChips(paths) {
+    const users = messagesEl.querySelectorAll('.msg.user');
+    const last = users[users.length - 1];
+    if (!last || !paths.length) return;
+    const row = document.createElement('div');
+    row.className = 'attached-row';
+    row.innerHTML = paths.map((p) => `<span class="attached-chip" title="Attached for the model">📎 ${escapeHtml(p)}</span>`).join('');
+    (last.nextElementSibling && last.nextElementSibling.classList.contains('msg-actions') ? last.nextElementSibling : last).insertAdjacentElement('afterend', row);
   }
 
   function addSystemNote(text, cls) {
@@ -528,6 +555,7 @@
 
   function setBusy(value) {
     busy = value;
+    messagesEl.classList.toggle('busy', value);
     sendBtn.classList.toggle('hidden', value);
     stopBtn.classList.toggle('hidden', !value);
     if (value) {
@@ -598,6 +626,7 @@
   sendBtn.addEventListener('click', send);
   stopBtn.addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
   inputEl.addEventListener('keydown', (e) => {
+    if (mentionMenuKey(e)) return;
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
       e.preventDefault();
       send();
@@ -605,6 +634,108 @@
       vscode.postMessage({ type: 'stop' });
     }
   });
+
+  // ---------- @-mention menu ----------
+  // Typing "@" offers workspace files; picking one inserts its path, and the
+  // host attaches that file to the message on send.
+  let workspaceFileList = null;
+  let filesFetchedAt = 0;
+  let mentionItems = [];
+  let mentionIndex = 0;
+  const mentionMenu = document.createElement('div');
+  mentionMenu.id = 'mention-menu';
+  mentionMenu.className = 'hidden';
+  document.getElementById('composer').appendChild(mentionMenu);
+
+  function currentMention() {
+    return mentionAt(inputEl.value, inputEl.selectionStart ?? inputEl.value.length);
+  }
+
+  function updateMentionMenu() {
+    const m = currentMention();
+    if (!m) {
+      mentionMenu.classList.add('hidden');
+      mentionItems = [];
+      return;
+    }
+    if (!workspaceFileList || Date.now() - filesFetchedAt > 15_000) {
+      filesFetchedAt = Date.now(); // one request in flight at a time
+      vscode.postMessage({ type: 'listFiles' });
+      if (!workspaceFileList) {
+        mentionMenu.innerHTML = '<div class="mention-empty">Loading files…</div>';
+        mentionMenu.classList.remove('hidden');
+        return;
+      }
+    }
+    mentionItems = rankFiles(m.query, workspaceFileList, 10);
+    mentionIndex = Math.min(mentionIndex, Math.max(0, mentionItems.length - 1));
+    if (!mentionItems.length) {
+      mentionMenu.innerHTML = '<div class="mention-empty">No matching files</div>';
+    } else {
+      mentionMenu.innerHTML = mentionItems
+        .map((f, i) => {
+          const slash = f.lastIndexOf('/');
+          return `<div class="mention-item${i === mentionIndex ? ' active' : ''}" data-i="${i}"><span class="mention-base">${escapeHtml(f.slice(slash + 1))}</span><span class="mention-dir">${escapeHtml(f.slice(0, slash + 1))}</span></div>`;
+        })
+        .join('');
+      mentionMenu.querySelectorAll('.mention-item').forEach((el) =>
+        el.addEventListener('mousedown', (ev) => {
+          ev.preventDefault(); // keep focus in the textarea
+          pickMention(Number(el.dataset.i));
+        })
+      );
+    }
+    mentionMenu.classList.remove('hidden');
+  }
+
+  function pickMention(i) {
+    const m = currentMention();
+    const file = mentionItems[i];
+    if (!m || !file) return;
+    const cursor = inputEl.selectionStart ?? inputEl.value.length;
+    const insert = `@${file} `;
+    inputEl.value = inputEl.value.slice(0, m.start) + insert + inputEl.value.slice(cursor);
+    const at = m.start + insert.length;
+    inputEl.setSelectionRange(at, at);
+    mentionMenu.classList.add('hidden');
+    mentionItems = [];
+    inputEl.focus();
+  }
+
+  // Returns true when the key was handled by the open menu.
+  function mentionMenuKey(e) {
+    if (mentionMenu.classList.contains('hidden') || !mentionItems.length) {
+      if (e.key === 'Escape' && !mentionMenu.classList.contains('hidden')) {
+        mentionMenu.classList.add('hidden');
+        return true;
+      }
+      return false;
+    }
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      mentionIndex = (mentionIndex + (e.key === 'ArrowDown' ? 1 : -1) + mentionItems.length) % mentionItems.length;
+      updateMentionMenu();
+      return true;
+    }
+    if ((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') {
+      e.preventDefault();
+      pickMention(mentionIndex);
+      return true;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      mentionMenu.classList.add('hidden');
+      return true;
+    }
+    return false;
+  }
+
+  inputEl.addEventListener('input', () => {
+    mentionIndex = 0;
+    updateMentionMenu();
+  });
+  inputEl.addEventListener('click', updateMentionMenu);
+  inputEl.addEventListener('blur', () => setTimeout(() => mentionMenu.classList.add('hidden'), 150));
 
   // ---------- Plan/Act mode ----------
   modeButtons.forEach((btn) => {
@@ -617,8 +748,8 @@
     modeButtons.forEach((btn) => btn.classList.toggle('active', btn.dataset.mode === mode));
     inputEl.placeholder =
       mode === 'plan'
-        ? 'Ask Cortex to investigate and propose a plan (no changes will be made)...'
-        : 'Ask Cortex to do something in this workspace... (Enter to send, Shift+Enter for a new line)';
+        ? 'Ask Cortex to investigate and propose a plan (no changes will be made)... @ to attach a file'
+        : 'Ask Cortex to do something... @ to attach a file, Enter to send, Shift+Enter for a new line';
   }
 
   // ---------- Manual/Auto approval toggle ----------
@@ -781,7 +912,7 @@
       return;
     }
     for (const m of messages) {
-      if (m.role === 'user') addUserMessage(m.text);
+      if (m.role === 'user') addUserMessage(m.text, m.image);
       else if (m.role === 'assistant') {
         const div = document.createElement('div');
         div.className = 'msg assistant';
@@ -830,7 +961,7 @@
         bannerEl.classList.remove('hidden');
         break;
       case 'insertText':
-        inputEl.value = msg.text + (inputEl.value ? '\n' + inputEl.value : '');
+        inputEl.value = msg.replace ? msg.text : msg.text + (inputEl.value ? '\n' + inputEl.value : '');
         inputEl.focus();
         inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
         break;
@@ -865,6 +996,14 @@
         break;
       case 'notice':
         addSystemNote(msg.text);
+        break;
+      case 'attached':
+        addAttachedChips(msg.paths || []);
+        break;
+      case 'files':
+        workspaceFileList = msg.files || [];
+        filesFetchedAt = Date.now();
+        updateMentionMenu();
         break;
       case 'checkpointCreated': {
         const div = document.createElement('div');

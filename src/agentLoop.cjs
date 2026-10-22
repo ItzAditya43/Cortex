@@ -7,138 +7,17 @@
 
 const crypto = require('crypto');
 const { chat } = require('./provider.cjs');
-const { tools, isToolAvailable } = require('./tools.cjs');
+const { tools, isToolAvailable, apiToolsFor } = require('./tools.cjs');
 const { buildSystemPrompt } = require('./systemPrompt.cjs');
-const { buildContextMessages, DEFAULT_BUDGET_TOKENS } = require('./contextManager.cjs');
+const { buildContextMessages, estimateTokens, DEFAULT_BUDGET_TOKENS } = require('./contextManager.cjs');
 const { verifySyntax } = require('./verify.cjs');
 const { pickModel } = require('./router.cjs');
 const { getStaleWarning } = require('./fileTracker.cjs');
 const { classifyError } = require('./errorClassification.cjs');
 const lsp = require('./lsp.cjs');
-const { numCtxFor } = require('./ollamaClient.cjs');
-
-// Pull a TOOL_CALL: {...} instruction out of a model response.
-//
-// String-aware (braces inside quoted strings don't affect depth counting)
-// and self-repairing: smaller/weaker local models frequently emit raw
-// literal newlines/tabs inside JSON string values instead of escaping them
-// as \n / \t, which would otherwise make JSON.parse throw. We fix those up
-// on the fly instead of giving up.
-function parseToolCall(text) {
-  const marker = 'TOOL_CALL:';
-  const idx = text.indexOf(marker);
-  if (idx === -1) return { attempted: false };
-
-  const after = text.slice(idx + marker.length);
-  const start = after.indexOf('{');
-  if (start === -1) {
-    return { attempted: true, ok: false, error: 'no JSON object found after TOOL_CALL:', raw: after };
-  }
-
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  let end = -1;
-  let sanitized = '';
-
-  for (let i = start; i < after.length; i++) {
-    const ch = after[i];
-    if (inString) {
-      if (escaped) {
-        sanitized += ch;
-        escaped = false;
-        continue;
-      }
-      if (ch === '\\') {
-        // Code in a string value often carries regex escapes the model did
-        // not double: "\s+", "\d", "\.". Those are illegal in JSON, so the
-        // whole call failed to parse and the model resent it unchanged until
-        // the step budget ran out. A backslash that doesn't start a valid
-        // JSON escape is a literal backslash — keep it as one.
-        const next = after[i + 1];
-        const validEscape =
-          next !== undefined && ('"\\/bfnrt'.includes(next) || (next === 'u' && /^[0-9a-fA-F]{4}$/.test(after.slice(i + 2, i + 6))));
-        sanitized += validEscape ? ch : '\\\\';
-        escaped = validEscape;
-        continue;
-      }
-      if (ch === '"') {
-        sanitized += ch;
-        inString = false;
-        continue;
-      }
-      if (ch === '\n') {
-        sanitized += '\\n';
-        continue;
-      }
-      if (ch === '\r') {
-        sanitized += '\\r';
-        continue;
-      }
-      if (ch === '\t') {
-        sanitized += '\\t';
-        continue;
-      }
-      sanitized += ch;
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      sanitized += ch;
-      continue;
-    }
-    if (ch === '{') depth++;
-    else if (ch === '}') depth--;
-    sanitized += ch;
-    if (depth === 0) {
-      end = i;
-      break;
-    }
-  }
-
-  if (end === -1) {
-    return { attempted: true, ok: false, error: 'unterminated JSON object (missing closing brace)', raw: after.slice(start) };
-  }
-
-  try {
-    return { attempted: true, ok: true, data: JSON.parse(sanitized) };
-  } catch (err) {
-    return { attempted: true, ok: false, error: err.message, raw: sanitized };
-  }
-}
-
-// Parses EVERY TOOL_CALL in a response, not just the first.
-//
-// One call per round-trip means reading five files costs five full model
-// round-trips. Letting the model emit several read-only calls at once and
-// running them together collapses that into one, which is the single
-// biggest latency win available here and costs no quality — strong models
-// batch reads naturally when told they can.
-//
-// Mutating calls are deliberately NOT batched: each one needs its own
-// approval, diff and checkpoint, and later edits in a batch could be built
-// on assumptions invalidated by earlier ones.
-function parseToolCalls(text) {
-  const calls = [];
-  let rest = text;
-  let offset = 0;
-  while (true) {
-    const parsed = parseToolCall(rest);
-    if (!parsed.attempted) break;
-    calls.push(parsed);
-    if (!parsed.ok) break; // stop at the first malformed one so the model gets a clear error
-    // advance past this call's closing brace to look for the next one
-    const idx = rest.indexOf('TOOL_CALL:');
-    const nextSearchFrom = idx + 'TOOL_CALL:'.length;
-    const following = rest.slice(nextSearchFrom);
-    const nextIdx = following.indexOf('TOOL_CALL:');
-    if (nextIdx === -1) break;
-    rest = following.slice(nextIdx);
-    offset += nextSearchFrom + nextIdx;
-    if (calls.length >= 8) break; // sanity cap
-  }
-  return calls;
-}
+const { numCtxFor, modelInfo } = require('./ollamaClient.cjs');
+const { toNativeMessages, synthesizeReply, extractJsonToolCalls } = require('./nativeTools.cjs');
+const { parseToolCall, parseToolCalls } = require('./toolCallParser.cjs');
 
 // Emergency in-place compaction for a context overflow mid-turn. Keeps the
 // task (the first user message) and the most recent exchanges, replacing the
@@ -194,6 +73,7 @@ function looksLikeNudgeArtifact(text) {
  * @param {number} [opts.contextBudgetTokens] rough token budget for history sent per turn (see contextManager.cjs)
  * @param {number} [opts.numCtx]          explicit Ollama context window; 0/undefined derives it from contextBudgetTokens
  * @param {string} [opts.provider]        'ollama' (default) or 'openai-compatible'
+ * @param {'auto'|'native'|'text'} [opts.toolCalling] how tools are offered to the model (see resolveToolMode)
  * @param {string} [opts.apiKey]
  * @param {string} [opts.escalateModel]   stronger model to switch to after repeated failures
  * @param {string} [opts.testCommand]     run once after a turn that changed files; failures go back to the model
@@ -213,6 +93,28 @@ function looksLikeNudgeArtifact(text) {
  * @param {(message: string) => void} opts.onError
  * @param {(message: string) => void} [opts.onLog]         optional diagnostic sink (wired to the host's OutputChannel)
  */
+// Below this size, measured: qwen2.5-coder:3b passed 8/12 benchmark tasks
+// through the text protocol but 5/12 natively — it writes the call as JSON
+// prose, or stops to ask instead of acting. gemma4:31b and gpt-oss:120b
+// pass 12/12 natively.
+const NATIVE_MIN_PARAMS_B = 7;
+
+/**
+ * Decides how tools are offered to a model. "auto" uses native tool calling
+ * when Ollama reports the model supports it and it is big enough to use it
+ * well (unknown size counts as big enough); the text protocol otherwise,
+ * and always for openai-compatible servers.
+ * @returns {Promise<'native'|'text'>}
+ */
+/** @param {{host: string, model: string, provider?: string, toolCalling?: string}} opts */
+async function resolveToolMode({ host, provider, model, toolCalling = 'auto' }) {
+  if (provider === 'openai-compatible' || toolCalling === 'text') return 'text';
+  if (toolCalling === 'native') return 'native';
+  const { capabilities, paramsB } = await modelInfo({ host, model });
+  if (!capabilities.includes('tools')) return 'text';
+  return paramsB !== null && paramsB < NATIVE_MIN_PARAMS_B ? 'text' : 'native';
+}
+
 async function runTurn(opts) {
   const {
     history,
@@ -231,6 +133,7 @@ async function runTurn(opts) {
     planMode,
     contextBudgetTokens = DEFAULT_BUDGET_TOKENS,
     numCtx,
+    toolCalling = 'auto',
     testCommand,
     onTestRun,
     ctx,
@@ -274,10 +177,19 @@ async function runTurn(opts) {
     const escalating = !!escalateModel && escalateModel !== model && consecutiveFailures >= 2;
     const activeModel = escalating ? escalateModel : pickModel({ model, fastModel, usedMutatingTool, isFirstStep: steps === 1 });
     const routedLabel = escalating ? ' (escalated after repeated failures)' : activeModel !== model ? ' (routed: fast)' : '';
-    const system = buildSystemPrompt({ memoryNotes, cwd: root, openFile, planMode, selection, ctx });
-    const messages = buildContextMessages(system, history, contextBudgetTokens);
-    onLog?.(`step ${steps}: sending ${messages.length} message(s) to ${activeModel}${routedLabel} (budget ${contextBudgetTokens} tok)`);
+    const native = (await resolveToolMode({ host, provider, model: activeModel, toolCalling })) === 'native';
+    const apiTools = native ? apiToolsFor({ root, ctx }) : undefined;
+    const system = buildSystemPrompt({ memoryNotes, cwd: root, openFile, planMode, selection, ctx, nativeTools: native });
+    // Native tool schemas are part of the prompt the model sees, so they
+    // come out of the same budget the history is trimmed to.
+    const budget = native ? Math.max(1000, contextBudgetTokens - estimateTokens(JSON.stringify(apiTools))) : contextBudgetTokens;
+    const canonical = buildContextMessages(system, history, budget);
+    const messages = native ? toNativeMessages(canonical) : canonical;
+    onLog?.(
+      `step ${steps}: sending ${messages.length} message(s) to ${activeModel}${routedLabel} (budget ${contextBudgetTokens} tok, ${native ? 'native' : 'text'} tools)`
+    );
     onStep?.(steps, activeModel);
+    let nativeCalls = [];
 
     let reply;
     try {
@@ -289,6 +201,8 @@ async function runTurn(opts) {
         messages,
         temperature,
         numCtx: contextWindow,
+        tools: apiTools,
+        onToolCalls: (calls) => nativeCalls.push(...calls),
         signal,
         onToken,
         onThinking,
@@ -326,6 +240,19 @@ async function runTurn(opts) {
 
       onError(failure.advice ? `${err.message}\n\n${failure.advice}` : err.message);
       return;
+    }
+
+    if (native) {
+      if (!nativeCalls.length) {
+        // offered native tools, wrote the call as JSON text instead
+        const fromText = extractJsonToolCalls(reply, new Set(apiTools.map((t) => t.function.name)));
+        if (fromText.length) {
+          onLog?.(`step ${steps}: recovered ${fromText.length} tool call(s) written as JSON text`);
+          nativeCalls = fromText;
+          reply = '';
+        }
+      }
+      if (nativeCalls.length) reply = synthesizeReply(reply, nativeCalls);
     }
 
     const parsed = parseToolCall(reply);
@@ -597,4 +524,4 @@ async function runTurn(opts) {
   onError('Stopped: too many steps without a final answer. Try starting a new chat or narrowing your request.');
 }
 
-module.exports = { runTurn, parseToolCall, parseToolCalls };
+module.exports = { runTurn, parseToolCall, parseToolCalls, resolveToolMode };

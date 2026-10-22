@@ -38,6 +38,7 @@ async function run(port, prompt) {
   await runTurn({
     history: [{ role: 'user', content: prompt }],
     root: '/tmp',
+    toolCalling: 'text',
     host: `http://localhost:${port}`,
     provider: 'ollama',
     model: 'test',

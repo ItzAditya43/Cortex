@@ -10,6 +10,7 @@
 //   node eval/run.cjs --model a --model b        compare two models
 //   node eval/run.cjs --tags edit --verbose      only edit tasks, show details
 //   node eval/run.cjs --model X --json > run.json  machine-readable output
+//   node eval/run.cjs --tool-calling text      force the TOOL_CALL text protocol (auto|native|text)
 //
 // Results are compared against eval/baseline.json when present, so a
 // regression shows up as a diff rather than a number you have to remember.
@@ -37,6 +38,7 @@ function parseArgs(argv) {
     saveBaseline: false,
     repeat: 1,
     timeoutMs: 180_000,
+    toolCalling: process.env.CORTEX_TOOL_CALLING || 'auto',
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -50,9 +52,10 @@ function parseArgs(argv) {
     else if (a === '--verbose' || a === '-v') opts.verbose = true;
     else if (a === '--json') opts.json = true;
     else if (a === '--save-baseline') opts.saveBaseline = true;
+    else if (a === '--tool-calling') opts.toolCalling = argv[++i];
     else if (a === '--repeat') opts.repeat = Math.max(1, parseInt(argv[++i], 10) || 1);
     else if (a === '--help' || a === '-h') {
-      console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 17).join('\n').replace(/^\/\/ ?/gm, ''));
+      console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(1, 18).join('\n').replace(/^\/\/ ?/gm, ''));
       process.exit(0);
     }
   }
@@ -88,6 +91,7 @@ async function runTask(task, model, opts) {
         model,
         temperature: opts.temperature,
         maxSteps: opts.maxSteps,
+        toolCalling: opts.toolCalling,
         memoryNotes: '',
         planMode: false,
         // Grading is about capability, not the approval UX, so everything is

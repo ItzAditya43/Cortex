@@ -61,6 +61,7 @@ function activate(context) {
         temperature: c.get('temperature'),
         maxSteps: c.get('maxSteps'),
         contextBudgetTokens: c.get('contextBudgetTokens'),
+        toolCalling: c.get('toolCalling') || 'auto',
       };
     },
     getRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
