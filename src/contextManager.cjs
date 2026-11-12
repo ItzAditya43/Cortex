@@ -16,6 +16,36 @@
 const CHARS_PER_TOKEN = 4;
 const DEFAULT_BUDGET_TOKENS = 6000;
 
+// Budgets used when the user hasn't set one (contextBudgetTokens: 0).
+const LOCAL_SMALL_BUDGET = 8_000; // < 7B: runs on modest hardware, where a big window costs real memory
+const LOCAL_BUDGET = 16_000;
+const CLOUD_BUDGET_CAP = 100_000;
+const OPENAI_COMPAT_BUDGET = 32_000;
+const REPLY_RESERVE = 8_192;
+
+/**
+ * How much conversation to send per request.
+ *
+ * A fixed 6k budget made sense for a 3B model on a laptop and wasted almost
+ * everything a hosted 250k-context model offers: long tasks lost their own
+ * early steps for no reason. An explicit setting always wins; otherwise the
+ * budget follows the model — what it supports, and whether a big window
+ * costs local memory or nothing.
+ *
+ * @param {{host: string, provider?: string, model: string, configured?: number}} opts
+ * @returns {Promise<number>}
+ */
+async function resolveContextBudget({ host, provider, model, configured }) {
+  if (Number(configured) > 0) return Math.floor(Number(configured));
+  if (provider === 'openai-compatible') return OPENAI_COMPAT_BUDGET;
+  const { modelInfo } = require('./ollamaClient.cjs');
+  const info = await modelInfo({ host, model });
+  const ceiling = info.contextLength ? Math.max(2_000, info.contextLength - REPLY_RESERVE) : Infinity;
+  if (info.cloud) return Math.min(CLOUD_BUDGET_CAP, ceiling === Infinity ? CLOUD_BUDGET_CAP : ceiling);
+  const base = info.paramsB !== null && info.paramsB < 7 ? LOCAL_SMALL_BUDGET : LOCAL_BUDGET;
+  return Math.min(base, ceiling);
+}
+
 function estimateTokens(text) {
   return Math.ceil((text || '').length / CHARS_PER_TOKEN);
 }
@@ -96,4 +126,11 @@ function buildContextMessages(systemPrompt, history, budgetTokens = DEFAULT_BUDG
   return messages;
 }
 
-module.exports = { estimateTokens, buildContextMessages, DEFAULT_BUDGET_TOKENS };
+/** Rough size of a whole history, in tokens. */
+function historyTokens(history) {
+  let n = 0;
+  for (const m of history) n += estimateTokens(m.content) + 4;
+  return n;
+}
+
+module.exports = { estimateTokens, historyTokens, buildContextMessages, resolveContextBudget, DEFAULT_BUDGET_TOKENS };

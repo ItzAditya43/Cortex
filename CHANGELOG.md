@@ -2,7 +2,85 @@
 
 All notable changes to Cortex are documented here.
 
-## [Unreleased]
+## [0.2.0] — 2026-11-13
+
+### Added
+- **A real CLI: `cortex`.** The terminal agent is rebuilt around the same
+  engine as the extension: streaming Markdown output, a line per tool call
+  with its result, coloured diffs before every edit, and approvals you can
+  answer with yes / no / always / "do this instead". Sessions are saved and
+  resumable (`cortex -c`, `cortex -r`, `/resume`), `/undo` reverts a turn's
+  file changes, and there are commands for the things you reach for
+  mid-task: `/model`, `/plan`, `/compact`, `/diff`, `/status`, `/approvals`,
+  `/init`, `/memory`, `/tools`. `@path` attaches files (Tab completes),
+  `!cmd` runs a shell command into the conversation, Esc interrupts.
+  One-shot mode (`cortex -p`, `cortex exec`, piped stdin, `--json`) keeps
+  stdout for the answer so it can be scripted. The destructive-command
+  safety floor now applies in the CLI too, including under `--auto-approve`.
+- **Context sized to the model.** `cortex.contextBudgetTokens` defaults to
+  automatic: about 8k tokens for small local models, 16k for larger local
+  ones, up to 100k for hosted models — instead of 6k for everything.
+- **Automatic compaction.** When a conversation approaches its budget the
+  older part is summarized by the model (request, work done, findings, what
+  remains) and the turn continues. `/compact` uses the same summarizer.
+- **Several tool calls per response.** Edits and commands sent together now
+  all run, in order, each with its own approval, diff and undo point; a
+  failure or a declined call stops the ones after it and the model is told
+  which were skipped. Previously only the first ran.
+- **Function calling for OpenAI-compatible servers** (OpenAI, OpenRouter,
+  Groq, LM Studio, vLLM, llama.cpp), with streamed tool calls, token usage
+  and reasoning output. If a server or model rejects tools, Cortex falls
+  back to the text protocol by itself.
+- **New and sharper tools.** `glob` finds files by pattern. `read_file`
+  takes `offset`/`limit` and says which lines it showed. `edit_file` takes
+  `replace_all`. `search_code` uses ripgrep when installed (faster, honours
+  `.gitignore`) and takes `glob`, `ignore_case` and `context`.
+  `run_command` takes `timeout_seconds`.
+- **Custom slash commands.** `.cortex/commands/<name>.md` (or
+  `~/.cortex/commands/`) becomes `/<name>` in the CLI and the VS Code panel.
+- **More rule files.** `CORTEX.md` and `CLAUDE.md` are read alongside
+  `AGENTS.md` and `.cortexrules`; `~/.cortex/CORTEX.md` applies everywhere.
+
+### Fixed
+- **An ambiguous edit now says where.** "old_str matches 2 places" lists the
+  matching lines with the line above each, so the model can single one out.
+  On a 3B model this turned a 50-step failure (it rewrote both matches, broke
+  a passing function, then edited the test) into a correct 6-step fix.
+- **No approval prompt for an edit that cannot apply.** A snippet that is
+  missing or ambiguous is reported straight back to the model instead of
+  first asking you to approve a call that can only fail.
+- **Writing a file back unchanged** is reported as "no change" — no prompt,
+  no undo point — instead of looking like a successful edit the model then
+  repeats.
+- **`write_file` will not overwrite a file the agent has not read.** A model
+  that rewrites a file from what it imagines is in it destroys the rest; it
+  is told to read the file first.
+- **`cortex -p` no longer hangs** when started by another program that
+  leaves stdin open (CI runners, scripts); only a real pipe is read to the end.
+- **Tool calls with single-quoted strings** (`"old_str": '"1.0.0"'`), which
+  small models produce and then resend unchanged until the step budget runs
+  out, are repaired. A bare array of edits is accepted as `multi_edit`
+  arguments.
+- **The loop breaker no longer blocks a legitimate re-check.** Searching
+  again after an edit is a new question; only repeats with nothing changed
+  in between count. A model that ignores the warning is stopped after six
+  identical calls instead of burning every remaining step.
+
+- **Unrequested commits are refused.** `git_commit`, `git commit` and
+  `git push` only run when the conversation asked for a commit or push;
+  small models otherwise commit their own work even under a rule not to.
+- **Stuck models stop early with a reason**: six malformed tool calls in a
+  row, or a run of plan/notes updates with no work in between, end the turn
+  instead of using up every step.
+
+### Changed
+- The system prompt for capable models now spells out a working method
+  (understand, change, verify, report) and tells the model its platform,
+  branch and date. Small models on the text protocol keep the short prompt.
+- `cortex.maxSteps` defaults to 50 (was 25), and running out of steps says
+  how to continue instead of suggesting a new chat.
+- Declining an approval can carry a reason, which is passed to the model.
+- Rate-limit retries back off exponentially (2s, 4s, 8s).
 
 ### Added (late October 2026)
 - **Native tool calling.** Models that support Ollama's tools API get real

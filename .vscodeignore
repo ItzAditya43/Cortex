@@ -13,3 +13,4 @@ eval/**
 SMOKE-TEST.md
 test/**
 .vscode-test/**
+.npmignore

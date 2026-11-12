@@ -109,4 +109,73 @@ exports.tests = {
     await getExtension();
     await vscode.commands.executeCommand('cortex.openWalkthrough');
   },
+
+  'a full agent turn runs through the chat provider in the real host and changes the workspace': async () => {
+    const ext = await getExtension();
+    const provider = ext.exports && ext.exports._chatProvider;
+    assert.ok(provider, 'activate() did not expose the chat provider');
+    const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    assert.ok(root, 'the test host was not opened on a workspace folder');
+
+    // A stand-in model server: reads the file, then sends two changes in one
+    // response (exercising multi-call execution), then answers.
+    const http = require('http');
+    const replies = [
+      'TOOL_CALL: {"name": "read_file", "arguments": {"path": "config.js"}}',
+      'TOOL_CALL: {"name": "edit_file", "arguments": {"path": "config.js", "old_str": "3000", "new_str": "8080"}}\nTOOL_CALL: {"name": "write_file", "arguments": {"path": "NOTES.md", "content": "port is 8080\\n"}}',
+      'Changed the port to 8080 and noted it in NOTES.md.',
+    ];
+    let n = 0;
+    const server = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (d) => (body += d));
+      req.on('end', () => {
+        if (req.url !== '/api/chat') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end('{}');
+          return;
+        }
+        const content = replies[Math.min(n++, replies.length - 1)];
+        res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+        res.end(JSON.stringify({ message: { content }, done: true, prompt_eval_count: 100, eval_count: 10 }) + '\n');
+      });
+    });
+    await new Promise((r) => server.listen(0, () => r(undefined)));
+    const cfg = vscode.workspace.getConfiguration('cortex');
+    const G = vscode.ConfigurationTarget.Global;
+    const saved = { host: cfg.get('host'), autoApprove: cfg.get('autoApprove'), toolCalling: cfg.get('toolCalling'), useTerminal: cfg.get('useTerminal'), animateEdits: cfg.get('animateEdits') };
+    await cfg.update('host', `http://localhost:${/** @type {import("net").AddressInfo} */ (server.address()).port}`, G);
+    await cfg.update('autoApprove', true, G);
+    await cfg.update('toolCalling', 'text', G);
+    await cfg.update('animateEdits', false, G);
+
+    const posted = [];
+    const realPost = provider.post.bind(provider);
+    provider.post = (msg) => {
+      posted.push(msg);
+      realPost(msg);
+    };
+    try {
+      await provider.onSend('change the port in config.js to 8080 and note it in NOTES.md');
+      const errors = posted.filter((m) => m.type === 'error');
+      assert.deepStrictEqual(errors, [], `the turn reported errors: ${JSON.stringify(errors)}`);
+      assert.strictEqual(fs.readFileSync(path.join(root, 'config.js'), 'utf8'), 'module.exports = { port: 8080 };\n');
+      assert.strictEqual(fs.readFileSync(path.join(root, 'NOTES.md'), 'utf8'), 'port is 8080\n');
+      assert.strictEqual(posted.filter((m) => m.type === 'toolCall').length, 3, 'three tool cards: one read, two changes');
+      const final = posted.find((m) => m.type === 'final');
+      assert.ok(final && /8080/.test(final.text), 'the final answer reached the panel');
+      const usage = posted.find((m) => m.type === 'usage');
+      assert.ok(usage && usage.contextBudget > 0, 'the context meter gets a real budget, not 0');
+      assert.ok(posted.some((m) => m.type === 'checkpointCreated' && m.count === 2), 'both changes are in one undo point');
+
+      // Undo the turn the way the panel's button does.
+      await vscode.commands.executeCommand('cortex.revertLastTurn');
+      assert.strictEqual(fs.readFileSync(path.join(root, 'config.js'), 'utf8'), 'module.exports = { port: 3000 };\n', 'revert restores the edit');
+      assert.strictEqual(fs.existsSync(path.join(root, 'NOTES.md')), false, 'revert removes the created file');
+    } finally {
+      provider.post = realPost;
+      for (const [k, v] of Object.entries(saved)) await cfg.update(k, v === cfg.inspect(k)?.defaultValue ? undefined : v, G);
+      server.close();
+    }
+  },
 };

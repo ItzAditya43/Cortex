@@ -39,6 +39,7 @@ async function run(port, prompt) {
     history: [{ role: 'user', content: prompt }],
     root: '/tmp',
     toolCalling: 'text',
+    contextBudgetTokens: 6000,
     host: `http://localhost:${port}`,
     provider: 'ollama',
     model: 'test',

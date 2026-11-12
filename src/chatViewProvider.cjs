@@ -13,7 +13,7 @@ const {
   listSessions,
   deleteSession,
 } = require('./memory.cjs');
-const { listModels, chat } = require('./provider.cjs');
+const { listModels } = require('./provider.cjs');
 const { shouldAutoApprove } = require('./permissions.cjs');
 const { retrieveRelevantNotes } = require('./semanticMemory.cjs');
 const { reviewAction } = require('./approveForMe.cjs');
@@ -27,6 +27,10 @@ const { buildEditAnimation } = require('./editAnimation.cjs');
 const logger = require('./logger.cjs');
 const { buildDiffView } = require('./lineDiff.cjs');
 const { workspaceFiles, expandMentions, stripAttachments } = require('./mentions.cjs');
+const { splitResults } = require('./nativeTools.cjs');
+const { compactHistory: summarizeHistory } = require('./compactor.cjs');
+const { resolveContextBudget } = require('./contextManager.cjs');
+const { listCustomCommands, expandCustomCommand } = require('./slashCommands.cjs');
 
 const MUTATING_TOOLS = Object.entries(tools)
   .filter(([, t]) => t.confirm)
@@ -75,9 +79,14 @@ function simplifyHistoryForDisplay(history) {
       if (content.startsWith('TOOL_RESULT:')) {
         const result = content.replace(/^TOOL_RESULT:\s*/, '');
         if (awaiting && awaiting.length) {
-          const card = awaiting[awaiting.length - 1];
-          card.result = result.length > 4000 ? `${result.slice(0, 4000)}\n…` : result;
-          card.isError = /^(ERROR|User declined)/.test(result);
+          // One response can carry several calls; their results come back
+          // together under a "--- name(args) ---" header each.
+          const parts = splitResults(result, awaiting.map((c) => c.name));
+          awaiting.forEach((card, i) => {
+            const r = String(parts[i]?.content ?? '');
+            card.result = r.length > 4000 ? `${r.slice(0, 4000)}\n…` : r;
+            card.isError = /^(ERROR|User declined|SKIPPED)/.test(r);
+          });
           awaiting = null;
         } else if (/^SYSTEM NOTE/.test(result)) {
           out.push({ role: 'system', text: result.replace(/^SYSTEM NOTE\s*[—-]\s*/, '').slice(0, 300) });
@@ -616,7 +625,13 @@ class ChatViewProvider {
             '- `/clear` — start a new chat, discarding this session\'s history\n' +
             '- `/compact` — summarize the conversation so far to free up context, keeping the gist\n' +
             '- `/init` — scan this project and (re)generate `.cortexrules` with conventions the agent should follow\n' +
-            '- `/help` — show this message',
+            '- `/help` — show this message' +
+            (listCustomCommands(root).length
+              ? '\n\n**Your commands** (`.cortex/commands/*.md`):\n\n' +
+                listCustomCommands(root)
+                  .map((c) => `- \`/${c.name}\`${c.description ? ` — ${c.description}` : ''}`)
+                  .join('\n')
+              : '\n\nAdd your own: a Markdown file at `.cortex/commands/<name>.md` becomes `/<name>`; `$ARGUMENTS` in it is replaced by what you type after the command.'),
           steps: 0,
           elapsedMs: 0,
         });
@@ -639,29 +654,16 @@ class ChatViewProvider {
     }
     this.post({ type: 'busy', value: true });
     const cfg = this.cfg();
-    const transcript = this.history.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join('\n\n').slice(0, 20_000);
     try {
-      const summary = await chat({
-        host: cfg.host,
-        provider: cfg.provider,
-        apiKey: cfg.apiKey,
-        model: cfg.model,
-        temperature: 0.1,
-        messages: [
-          {
-            role: 'system',
-            content:
-              'Summarize the following coding-agent conversation into a concise brief a fresh agent could resume from: what the user asked for, what was already done (files touched, decisions made), and what remains. Plain text, no preamble.',
-          },
-          { role: 'user', content: transcript },
-        ],
-      });
       const before = this.history.length;
-      this.history = [{ role: 'user', content: `[Earlier conversation summary]\n${summary.trim()}` }];
+      const chatOpts = { host: cfg.host, provider: cfg.provider, apiKey: cfg.apiKey, model: cfg.model };
+      const budgetTokens = await resolveContextBudget({ ...chatOpts, configured: cfg.contextBudgetTokens });
+      const res = await summarizeHistory({ history: this.history, chatOpts, budgetTokens, keepTail: false, logFn: (m) => logger.log(m) });
+      if (!res.ok) throw new Error(res.reason);
       saveHistory(root, this.sessionId, this.history);
       this.post({
         type: 'final',
-        text: `Compacted ${before} message(s) into a summary. Continuing from here.\n\n---\n${summary.trim()}`,
+        text: `Compacted ${before} message(s) into a summary. Continuing from here.\n\n---\n${res.summary}`,
         steps: 0,
         elapsedMs: 0,
       });
@@ -681,7 +683,10 @@ class ChatViewProvider {
     this.post({ type: 'busy', value: true });
     try {
       const rules = generateProjectRules(root);
-      tools.write_file.run({ path: '.cortexrules', content: rules }, root);
+      // Written directly: this is the user's own /init, not a model edit, so
+      // the "read before overwriting" guard on write_file does not apply.
+      require('fs').writeFileSync(require('path').join(root, '.cortexrules'), rules);
+      markAgentWrite(root, '.cortexrules');
       this.post({ type: 'final', text: `Wrote \`.cortexrules\`:\n\n\`\`\`markdown\n${rules}\n\`\`\``, steps: 0, elapsedMs: 0 });
     } catch (err) {
       this.post({ type: 'error', text: `/init failed: ${err.message}` });
@@ -709,6 +714,9 @@ class ChatViewProvider {
     }
     this.post({ type: 'userMessage', text, image });
     if (await this.handleSlashCommand(text)) return;
+    // A custom command (.cortex/commands/<name>.md) stands for the prompt it holds.
+    const custom = expandCustomCommand(text, root);
+    if (custom) text = custom.prompt;
 
     this.busy = true;
     this.abortController = new AbortController();
@@ -853,7 +861,7 @@ class ChatViewProvider {
           post({ type: 'notice', text: message });
         },
         onUsage: (u) => {
-          post({ type: 'usage', ...u, contextBudget: cfg.contextBudgetTokens });
+          post({ type: 'usage', ...u, contextBudget: u.contextBudget || cfg.contextBudgetTokens });
         },
         onToolCall: (name, args, callId) => {
           // Keyed by call: parallel read batches report results out of order,

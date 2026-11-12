@@ -37,6 +37,7 @@ test('reverting a created file removes it', async () => {
 
 test('reverting an overwrite restores the old contents', async () => {
   const dir = workspace({ 'a.js': 'old' });
+  tools.read_file.run({ path: 'a.js' }, dir); // an existing file has to be read before it can be overwritten
   const snap = await apply('write_file', { path: 'a.js', content: 'new' }, dir);
   restoreSnapshot(dir, snap);
   assert.strictEqual(fs.readFileSync(path.join(dir, 'a.js'), 'utf8'), 'old');

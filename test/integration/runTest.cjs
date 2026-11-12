@@ -3,6 +3,8 @@
 // isolation or against a mocked `vscode`; this is the only thing that proves
 // the extension works in the product it ships to.
 'use strict';
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { runTests } = require('@vscode/test-electron');
 
@@ -14,11 +16,15 @@ async function main() {
   // is what lets these tests run from inside an editor terminal at all.
   delete process.env.ELECTRON_RUN_AS_NODE;
 
+  // A real folder to open, so tests can run agent turns against a workspace.
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-int-ws-'));
+  fs.writeFileSync(path.join(workspace, 'config.js'), 'module.exports = { port: 3000 };\n');
+
   try {
     await runTests({
       extensionDevelopmentPath: path.resolve(__dirname, '../..'),
       extensionTestsPath: path.resolve(__dirname, './suite/index.cjs'),
-      launchArgs: ['--disable-extensions', '--disable-gpu', '--no-sandbox'],
+      launchArgs: [workspace, '--disable-extensions', '--disable-gpu', '--no-sandbox', '--disable-workspace-trust'],
       extensionTestsEnv: { ELECTRON_RUN_AS_NODE: undefined },
     });
   } catch (err) {

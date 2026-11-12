@@ -14,7 +14,7 @@ const { execFileSync, spawn } = require('child_process');
 const { appendMemoryNote } = require('./memory.cjs');
 const { indexNote } = require('./semanticMemory.cjs');
 const { wrapCommand, shellQuote: shq } = require('./sandbox.cjs');
-const { markAgentRead, markAgentWrite } = require('./fileTracker.cjs');
+const { markAgentRead, markAgentWrite, hasSeen } = require('./fileTracker.cjs');
 const { saveTasks, taskProgress } = require('./taskList.cjs');
 const lsp = require('./lsp.cjs');
 const codeIndex = require('./codeIndex.cjs');
@@ -43,6 +43,7 @@ const backgroundProcs = new Map(); // id -> {proc, output: string[], exitCode: n
 let backgroundIdCounter = 0;
 
 const COMMAND_TIMEOUT_MS = 120_000;
+const MAX_COMMAND_TIMEOUT_S = 1800;
 
 /**
  * Runs a shell command without blocking the extension host.
@@ -128,6 +129,132 @@ async function grep(flags, pattern, dir, root, signal) {
   return { ok: true, out: res.stdout.split(prefix).join(''), note };
 }
 
+// ripgrep when it is installed: several times faster than grep on a real
+// repo, and it honours .gitignore, so build output and vendored code stop
+// drowning the matches that matter. Looked up once per process.
+let rgPath;
+function findRg() {
+  if (rgPath !== undefined) return rgPath;
+  rgPath = null;
+  if (process.env.CORTEX_NO_RG) return rgPath;
+  try {
+    execFileSync('rg', ['--version'], { stdio: 'ignore', timeout: 5000 });
+    rgPath = 'rg';
+  } catch {
+    // not installed — callers fall back to grep / a directory walk
+  }
+  return rgPath;
+}
+
+/**
+ * Runs a program with an argv (no shell), cancellable, output bounded.
+ * @param {string} file
+ * @param {string[]} args
+ * @param {{cwd: string, timeoutMs?: number, signal?: AbortSignal, maxBytes?: number}} opts
+ * @returns {Promise<{stdout: string, stderr: string, code: number|null, timedOut: boolean}>}
+ */
+function runFile(file, args, { cwd, timeoutMs = 30_000, signal, maxBytes = 4 * 1024 * 1024 }) {
+  return new Promise((resolve) => {
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let proc;
+    try {
+      proc = spawn(file, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err) {
+      resolve({ stdout, stderr: err.message, code: null, timedOut });
+      return;
+    }
+    const kill = () => {
+      try {
+        proc.kill('SIGKILL');
+      } catch {
+        // already gone
+      }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      kill();
+    }, timeoutMs);
+    signal?.addEventListener('abort', kill);
+    proc.stdout.on('data', (d) => {
+      if (stdout.length < maxBytes) stdout += d.toString();
+      else kill(); // enough to fill any result budget many times over
+    });
+    proc.stderr.on('data', (d) => {
+      if (stderr.length < 64_000) stderr += d.toString();
+    });
+    const finish = (code) => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', kill);
+      resolve({ stdout, stderr, code, timedOut });
+    };
+    proc.on('error', (err) => {
+      stderr += err.message;
+      finish(null);
+    });
+    proc.on('close', finish);
+  });
+}
+
+const RG_EXCLUDES = ['-g', '!.git/', '-g', '!.cortex/', '-g', '!node_modules/'];
+
+/**
+ * Content search through ripgrep. Returns null when rg is not installed so
+ * the caller can fall back to grep.
+ * @param {{pattern: string, dir: string, root: string, glob?: string, ignoreCase?: boolean, context?: number, literal?: boolean, word?: boolean, signal?: AbortSignal}} o
+ */
+async function rgSearch({ pattern, dir, root, glob, ignoreCase, context, literal, word, signal }) {
+  const rg = findRg();
+  if (!rg) return null;
+  const base = ['--line-number', '--no-heading', '--color', 'never', '--hidden', '--max-columns', '400', '--max-columns-preview', ...RG_EXCLUDES];
+  if (ignoreCase) base.push('-i');
+  if (word) base.push('-w');
+  if (glob) base.push('-g', glob);
+  const ctxLines = Math.max(0, Math.min(10, Math.floor(Number(context) || 0)));
+  if (ctxLines) base.push('-C', String(ctxLines));
+  const rel = path.relative(root, dir) || '.';
+  const run = (fixed) => runFile(rg, [...base, ...(fixed ? ['-F'] : []), '-e', pattern, rel], { cwd: root, signal });
+  let res = await run(!!literal);
+  let note = '';
+  if (res.code === 2 && !literal && /regex parse error|unclosed|unopened|repetition|look-around|backreference/i.test(res.stderr)) {
+    res = await run(true);
+    note = '(not a valid regex — searched for it as literal text)\n';
+  }
+  if (res.timedOut) return { ok: false, out: 'search timed out after 30s — narrow it with "path" or "glob"' };
+  if (res.code === 1 && !res.stdout) return { ok: true, out: '', note };
+  if (res.code !== 0 && !res.stdout) return { ok: false, out: res.stderr.trim() || `rg exited ${res.code}` };
+  return { ok: true, out: res.stdout.replace(/^\.\//gm, ''), note };
+}
+
+// `**` crosses directories, `*` and `?` stay inside one path segment,
+// {a,b} alternates. Enough for the patterns models actually write.
+function globToRegExp(glob) {
+  let re = '';
+  let depth = 0;
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*') {
+      if (glob[i + 1] === '*') {
+        i++;
+        if (glob[i + 1] === '/') {
+          i++;
+          re += '(?:.*/)?';
+        } else re += '.*';
+      } else re += '[^/]*';
+    } else if (c === '?') re += '[^/]';
+    else if (c === '{') {
+      depth++;
+      re += '(?:';
+    } else if (c === '}' && depth) {
+      depth--;
+      re += ')';
+    } else if (c === ',' && depth) re += '|';
+    else re += c.replace(/[.+^$()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${re}$`);
+}
+
 // git with an argv, never a shell string, so a path or message can't be
 // interpreted as shell syntax.
 function git(root, args, input) {
@@ -155,6 +282,36 @@ function clampFileText(text) {
   );
   const note = lines.length > LIMITS.maxLines ? `\n...[${lines.length - LIMITS.maxLines} more lines not shown]` : '';
   return clippedLines.join('\n') + note;
+}
+
+// A numbered window of a file. Without offset/limit it is the top of the
+// file; whenever something is left out the result says exactly which lines
+// were shown and how to get the rest, so a model never edits against a file
+// it believes it has seen in full but hasn't.
+function renderFileWindow(content, offset, limit) {
+  const lines = content.split('\n');
+  if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop(); // trailing newline is not an extra line
+  const total = lines.length;
+  const start = Math.max(1, Math.floor(Number(offset) || 1));
+  if (start > total && total > 0) return `ERROR: offset ${start} is past the end of the file (${total} lines)`;
+  const want = Math.max(1, Math.min(LIMITS.maxLines, Math.floor(Number(limit) || LIMITS.maxLines)));
+  const out = [];
+  let chars = 0;
+  let i = start - 1;
+  for (; i < total && out.length < want; i++) {
+    const l = lines[i];
+    const shown = l.length > LIMITS.maxLineChars ? `${l.slice(0, LIMITS.maxLineChars)} …[${l.length - LIMITS.maxLineChars} more chars on this line]` : l;
+    const row = `${i + 1}\t${shown}`;
+    if (chars + row.length + 1 > LIMITS.read && out.length) break;
+    out.push(row);
+    chars += row.length + 1;
+  }
+  const end = start + out.length - 1;
+  let text = out.join('\n');
+  if (start > 1 || end < total) {
+    text += `\n...[showing lines ${start}-${end} of ${total}${end < total ? ` — call read_file with "offset": ${end + 1} for more` : ''}]`;
+  }
+  return text;
 }
 
 // Resolve a user/model-supplied relative path against the workspace root,
@@ -228,6 +385,15 @@ function applySnippet(content, oldStr, newStr) {
   const hit = locateSnippet(content, oldStr);
   if (!hit.ok) return hit;
   return { ok: true, how: hit.how, after: content.slice(0, hit.start) + (newStr ?? '') + content.slice(hit.end) };
+}
+
+// replace_all: every exact occurrence. No fuzzy matching here — relaxing the
+// match across many sites at once is how the wrong thing gets rewritten.
+function applyAll(content, oldStr, newStr) {
+  const parts = content.split(oldStr);
+  const count = parts.length - 1;
+  if (count === 0) return { ok: false, reason: 'not-found', count: 0 };
+  return { ok: true, how: 'exact', count, after: parts.join(newStr ?? '') };
 }
 
 const SKIP_DIRS = new Set(['node_modules', '.git', '.cortex', 'dist', 'build', 'out', '.next', '__pycache__', '.venv', 'venv', 'target']);
@@ -311,6 +477,38 @@ function closestRegion(content, oldStr) {
   return `\nThe closest text actually in the file (lines ${from + 1}-${to}):\n${shown}`;
 }
 
+// For an ambiguous edit: where the snippet occurs, with the line above each
+// occurrence, so the model can see what to add to single one out. Telling it
+// only "add more context" got the same snippet back; offering replace_all
+// here got both occurrences rewritten when one was meant.
+function ambiguousHint(content, oldStr, p) {
+  const firstLine = String(oldStr).split(/\r?\n/).find((l) => l.trim()) || '';
+  const lines = content.split(/\r?\n/);
+  const at = [];
+  for (let i = 0; i < lines.length && at.length < 6; i++) {
+    if (firstLine.trim() && lines[i].includes(firstLine.trim())) at.push(i);
+  }
+  if (!at.length) return '';
+  const shown = at
+    .map((i) => `${i > 0 ? `${i}\t${lines[i - 1]}\n` : ''}${i + 1}\t${lines[i]}`)
+    .join('\n  ...\n');
+  return (
+    `\nIt occurs at line${at.length === 1 ? '' : 's'} ${at.map((i) => i + 1).join(', ')} of ${p}:\n${shown}\n` +
+    `Decide which ONE you mean and include the line above it in old_str (and in new_str, unchanged) so the snippet matches only there.`
+  );
+}
+
+// True when write_file would replace a non-empty file the agent has neither
+// read nor written in this session.
+function unseenOverwrite(root, p, full) {
+  try {
+    if (!fs.existsSync(full) || hasSeen(root, p)) return false;
+    return fs.statSync(full).size > 0;
+  } catch {
+    return false;
+  }
+}
+
 const NOT_FOUND_HINT =
   'Re-read the file with read_file and copy the snippet verbatim. If it still fails, use write_file with the complete new file contents instead of retrying edit_file.';
 
@@ -329,7 +527,7 @@ const NOT_FOUND_HINT =
 const tools = {
   read_file: {
     description:
-      'Read one file, or several at once. Prefer passing an array — reading four files in one call costs one round-trip instead of four. Arguments: {"path": string} or {"path": string[]}',
+      'Read one file, or several at once. Prefer passing an array — reading four files in one call costs one round-trip instead of four. Output is numbered "line<TAB>text". For a big file pass offset (1-based first line) and limit (line count) to read just a window. Arguments: {"path": string | string[], "offset": number (optional), "limit": number (optional)}',
     confirm: false,
     readOnly: true,
     // Batching is part of the contract rather than something recovered by
@@ -342,17 +540,21 @@ const tools = {
           description: 'A workspace-relative file path, or an array of them to read together.',
           anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' }, maxItems: 12 }],
         },
+        offset: { type: 'number', description: '1-based line to start from (single file only). Omit to start at the top.' },
+        limit: { type: 'number', description: `How many lines to return (single file only). Default ${LIMITS.maxLines}.` },
       },
       required: ['path'],
     },
-    run: ({ path: p }, root) => {
+    run: ({ path: p, offset, limit }, root) => {
       if (Array.isArray(p)) {
         if (p.length === 0) return 'ERROR: path array is empty';
+        if (p.length === 1) return tools.read_file.run({ path: p[0], offset, limit }, root);
         return truncate(
           p.map((one) => `--- ${one} ---\n${tools.read_file.run({ path: one }, root)}`).join('\n\n'),
           LIMITS.read
         );
       }
+      if (!p || typeof p !== 'string') return 'ERROR: path is required';
       const full = safePath(root, p);
       if (!fs.existsSync(full)) return `ERROR: file not found: ${p}${suggestPaths(root, p)}`;
       if (fs.statSync(full).isDirectory()) return `ERROR: ${p} is a directory, use list_dir`;
@@ -360,11 +562,7 @@ const tools = {
       if (buf.subarray(0, 8000).includes(0)) return `ERROR: ${p} looks like a binary file (${buf.length} bytes) — not shown`;
       const content = buf.toString('utf8');
       markAgentRead(root, p);
-      const numbered = clampFileText(content)
-        .split('\n')
-        .map((l, i) => `${i + 1}\t${l}`)
-        .join('\n');
-      return truncate(numbered, LIMITS.read);
+      return renderFileWindow(content, offset, limit);
     },
   },
 
@@ -375,11 +573,20 @@ const tools = {
     preview: ({ path: p, content }, root) => {
       const full = safePath(root, p);
       const exists = fs.existsSync(full) && !fs.statSync(full).isDirectory();
+      if (exists && unseenOverwrite(root, p, full)) return { path: p, error: `${p} exists and has not been read yet` };
       const before = exists ? fs.readFileSync(full, 'utf8') : '';
       return { path: p, before, after: content ?? '', created: !exists };
     },
     run: ({ path: p, content }, root) => {
+      if (!p || typeof p !== 'string') return 'ERROR: path is required';
       const full = safePath(root, p);
+      if (fs.existsSync(full) && fs.statSync(full).isDirectory()) return `ERROR: ${p} is a directory`;
+      // Overwriting a file never looked at is how existing content gets
+      // destroyed: the model writes what it imagines the file holds plus its
+      // change. Reading first costs one call and makes the rewrite honest.
+      if (unseenOverwrite(root, p, full)) {
+        return `ERROR: ${p} already exists and you have not read it, so overwriting it would replace content you have not seen. Call read_file on it first, then either edit_file the part that needs to change or write_file the complete updated contents.`;
+      }
       fs.mkdirSync(path.dirname(full), { recursive: true });
       fs.writeFileSync(full, content ?? '');
       markAgentWrite(root, p);
@@ -389,15 +596,15 @@ const tools = {
 
   edit_file: {
     description:
-      'Replace one exact, unique snippet of text in a file with new text. Use this for small/targeted changes. Arguments: {"path": string, "old_str": string, "new_str": string}',
+      'Replace one exact, unique snippet of text in a file with new text. Use this for small/targeted changes. Set replace_all to true to replace EVERY occurrence instead (renaming a variable within a file). Arguments: {"path": string, "old_str": string, "new_str": string, "replace_all": boolean (optional)}',
     confirm: true,
     kind: 'edit',
-    preview: ({ path: p, old_str, new_str }, root) => {
+    preview: ({ path: p, old_str, new_str, replace_all }, root) => {
       const full = safePath(root, p);
       if (!fs.existsSync(full)) return { path: p, error: `file not found: ${p}` };
       const before = fs.readFileSync(full, 'utf8');
       if (!old_str) return { path: p, error: 'old_str must not be empty' };
-      const applied = applySnippet(before, old_str, new_str);
+      const applied = replace_all ? applyAll(before, old_str, new_str) : applySnippet(before, old_str, new_str);
       if (!applied.ok) {
         return {
           path: p,
@@ -409,20 +616,22 @@ const tools = {
       }
       return { path: p, before, after: applied.after };
     },
-    run: ({ path: p, old_str, new_str }, root) => {
+    run: ({ path: p, old_str, new_str, replace_all }, root) => {
       const full = safePath(root, p);
       if (!fs.existsSync(full)) return `ERROR: file not found: ${p}${suggestPaths(root, p)}`;
       const content = fs.readFileSync(full, 'utf8');
       if (!old_str) return 'ERROR: old_str must not be empty';
-      const applied = applySnippet(content, old_str, new_str);
+      if (old_str === new_str) return 'ERROR: old_str and new_str are identical — nothing to change';
+      const applied = replace_all ? applyAll(content, old_str, new_str) : applySnippet(content, old_str, new_str);
       if (!applied.ok) {
         if (applied.reason === 'ambiguous') {
-          return `ERROR: old_str matches ${applied.count} places in ${p}. Add more surrounding context to make it unique.`;
+          return `ERROR: old_str matches ${applied.count} places in ${p}, so it is not clear which one to change.${ambiguousHint(content, old_str, p)}`;
         }
         return `ERROR: old_str not found in ${p}. ${NOT_FOUND_HINT}${closestRegion(content, old_str)}`;
       }
       fs.writeFileSync(full, applied.after);
       markAgentWrite(root, p);
+      if (replace_all) return `OK: edited ${p} (replaced ${applied.count} occurrence${applied.count === 1 ? '' : 's'})`;
       return `OK: edited ${p}${applied.how === 'exact' ? '' : ` (matched ${applied.how} — your snippet's whitespace differed from the file)`}`;
     },
   },
@@ -446,24 +655,76 @@ const tools = {
 
   search_code: {
     description:
-      'Search file contents across the workspace (like grep -rnE: extended regex, e.g. "slugify|slug_ify" or "def \\w+_test"). Returns file:line:text. Arguments: {"pattern": string, "path": string (optional, default ".")}',
+      'Search file contents across the workspace with a regular expression (e.g. "slugify|slug_ify" or "def \\w+_test"). Returns file:line:text, skipping .gitignore\'d files. Narrow it with glob (e.g. "*.ts", "src/**/*.py"), add context lines around each hit, or ignore case. Arguments: {"pattern": string, "path": string (optional, default "."), "glob": string (optional), "ignore_case": boolean (optional), "context": number (optional)}',
+    confirm: false,
+    readOnly: true,
+    run: async ({ pattern, path: p, glob, ignore_case, context }, root, ctx) => {
+      if (!pattern) return 'ERROR: pattern is required';
+      const dir = safePath(root, p || '.');
+      if (!fs.existsSync(dir)) return `ERROR: path not found: ${p}${suggestPaths(root, p)}`;
+      let res = await rgSearch({ pattern, dir, root, glob, ignoreCase: !!ignore_case, context, signal: ctx?.signal });
+      if (!res) {
+        const flags = `-rnIE${ignore_case ? 'i' : ''}`;
+        const extra = glob ? ` --include=${shq(path.basename(String(glob)))}` : '';
+        res = await grep(flags + extra, pattern, dir, root, ctx?.signal);
+      }
+      const { ok, out, note } = res;
+      if (!ok) return `ERROR: ${out}`;
+      if (!out.trim()) return `${note || ''}(no matches)`;
+      const lines = out.trimEnd().split('\n');
+      const MAX_HITS = 250;
+      const body = lines.length > MAX_HITS ? `${lines.slice(0, MAX_HITS).join('\n')}\n...[${lines.length - MAX_HITS} more lines — narrow the search with "path" or "glob"]` : lines.join('\n');
+      return truncate(`${note || ''}${body}`, LIMITS.search);
+    },
+  },
+
+  glob: {
+    description:
+      'Find files by name pattern, newest first — e.g. "**/*.test.ts", "src/**/index.{js,ts}", "*.md". Use this to locate files; use search_code to look inside them. Arguments: {"pattern": string, "path": string (optional, default ".")}',
     confirm: false,
     readOnly: true,
     run: async ({ pattern, path: p }, root, ctx) => {
       if (!pattern) return 'ERROR: pattern is required';
       const dir = safePath(root, p || '.');
-      const { ok, out, note } = await grep('-rnIE', pattern, dir, root, ctx?.signal);
-      if (!ok) return `ERROR: ${out}`;
-      return truncate(`${note || ''}${out.trim() ? out : '(no matches)'}`, LIMITS.search);
+      if (!fs.existsSync(dir)) return `ERROR: path not found: ${p}${suggestPaths(root, p)}`;
+      // A bare name ("*.md", "config.json") means "anywhere", as in .gitignore.
+      const pat = String(pattern).replace(/^\.\//, '');
+      const anywhere = pat.includes('/') ? pat : `**/${pat}`;
+      let files = null;
+      const rg = findRg();
+      if (rg) {
+        const res = await runFile(rg, ['--files', '--hidden', ...RG_EXCLUDES, '-g', anywhere], { cwd: dir, signal: ctx?.signal });
+        if (res.code === 0 || res.code === 1) files = res.stdout.split('\n').filter(Boolean).map((f) => f.replace(/^\.\//, ''));
+      }
+      if (!files) {
+        const re = globToRegExp(anywhere);
+        files = listFiles(dir, 20_000).map((f) => f.split(path.sep).join('/')).filter((f) => re.test(f));
+      }
+      if (!files.length) return `(no files match ${pattern})`;
+      const relDir = path.relative(root, dir);
+      const withTime = files.map((f) => {
+        let mtime = 0;
+        try {
+          mtime = fs.statSync(path.join(dir, f)).mtimeMs;
+        } catch {
+          // vanished between listing and stat
+        }
+        return { f: relDir ? `${relDir.split(path.sep).join('/')}/${f}` : f, mtime };
+      });
+      withTime.sort((a, b) => b.mtime - a.mtime || a.f.localeCompare(b.f));
+      const MAX = 200;
+      const shown = withTime.slice(0, MAX).map((x) => x.f).join('\n');
+      return truncate(withTime.length > MAX ? `${shown}\n...[${withTime.length - MAX} more — narrow the pattern]` : shown, LIMITS.search);
     },
   },
 
   run_command: {
-    description: 'Run a shell command in the workspace root (e.g. tests, linters, git, build steps) and return stdout/stderr. Arguments: {"command": string}',
+    description: 'Run a shell command in the workspace root (e.g. tests, linters, git, build steps) and return stdout/stderr. Times out after 120s unless timeout_seconds says otherwise. Arguments: {"command": string, "timeout_seconds": number (optional)}',
     confirm: true,
     kind: 'command',
-    run: async ({ command }, root, ctx) => {
+    run: async ({ command, timeout_seconds }, root, ctx) => {
       if (!command) return 'ERROR: command is required';
+      const timeoutMs = Math.max(1, Math.min(MAX_COMMAND_TIMEOUT_S, Number(timeout_seconds) || COMMAND_TIMEOUT_MS / 1000)) * 1000;
       // Prefer VS Code's visible terminal so the user can watch (and keep)
       // what ran. Sandboxed commands deliberately stay on the child-process
       // path — bubblewrap wrapping is what provides the containment, and it
@@ -485,12 +746,12 @@ const tools = {
       const { command: toRun, sandboxed } = ctx?.sandboxMode === 'workspace-write'
         ? wrapCommand(command, root, { allowNetwork: !!ctx.sandboxAllowNetwork })
         : { command, sandboxed: false };
-      const res = await runShell(toRun, { cwd: root, signal: ctx?.signal });
+      const res = await runShell(toRun, { cwd: root, signal: ctx?.signal, timeoutMs });
       const tag = sandboxed ? '[sandboxed]\n' : '';
       if (res.aborted) return `${tag}ERROR: command cancelled by the user`;
       if (res.timedOut) {
         return truncate(
-          `${tag}ERROR: command timed out after ${COMMAND_TIMEOUT_MS / 1000}s and was killed. For servers and watchers use run_background instead.\nSTDOUT:\n${res.stdout}\nSTDERR:\n${res.stderr}`,
+          `${tag}ERROR: command timed out after ${timeoutMs / 1000}s and was killed. Pass a larger "timeout_seconds" if it legitimately needs longer. For servers and watchers use run_background instead.\nSTDOUT:\n${res.stdout}\nSTDERR:\n${res.stderr}`,
           LIMITS.command
         );
       }
@@ -912,7 +1173,7 @@ const tools = {
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const pattern = `(function|class|const|let|var|def|interface|type|struct|fn)\\s+${escaped}\\b|${escaped}\\s*[:=]\\s*(function|\\(|async)`;
       const dir = safePath(root, p || '.');
-      const { ok, out } = await grep('-rnIE', pattern, dir, root, ctx?.signal);
+      const { ok, out } = (await rgSearch({ pattern, dir, root, signal: ctx?.signal })) || (await grep('-rnIE', pattern, dir, root, ctx?.signal));
       if (!ok) return `ERROR: ${out}`;
       return truncate(out || `(no definition found for "${name}")`, LIMITS.search);
     },
@@ -928,7 +1189,8 @@ const tools = {
       const viaLsp = await lsp.findReferences(root, name).catch(() => null);
       if (viaLsp) return truncate(`(via language server)\n${viaLsp}`);
       const dir = safePath(root, p || '.');
-      const { ok, out } = await grep('-rnIwF', name, dir, root, ctx?.signal);
+      const { ok, out } =
+        (await rgSearch({ pattern: name, dir, root, literal: true, word: true, signal: ctx?.signal })) || (await grep('-rnIwF', name, dir, root, ctx?.signal));
       if (!ok) return `ERROR: ${out}`;
       const lines = out.trim().split('\n').filter(Boolean);
       return truncate(lines.length ? `${lines.length} reference(s):\n${lines.join('\n')}` : `(no references found for "${name}")`, LIMITS.search);
@@ -962,7 +1224,7 @@ function isToolAvailable(name, root, ctx) {
 // first thing the model reads rather than scattered among niche ones.
 /** @type {Array<[string, string[]]>} */
 const TOOL_GROUPS = [
-  ['Explore', ['read_file', 'list_dir', 'search_code', 'find_symbol', 'find_references', 'semantic_search', 'diagnostics']],
+  ['Explore', ['read_file', 'list_dir', 'glob', 'search_code', 'find_symbol', 'find_references', 'semantic_search', 'diagnostics']],
   ['Change files', ['edit_file', 'write_file', 'multi_edit', 'delete_file', 'rename_file']],
   ['Run', ['run_command', 'run_background', 'read_background_output', 'stop_background_process']],
   ['Git', ['git_status', 'git_diff', 'git_commit']],
@@ -1012,4 +1274,16 @@ function apiToolsFor({ root, ctx } = {}) {
   return [...new Set(ordered)].filter((n) => isToolAvailable(n, root, ctx)).map((n) => apiToolFor(n, tools[n]));
 }
 
-module.exports = { tools, listFiles, toolListForPrompt, apiToolsFor, isToolAvailable, safePath, registerExternalTool, unregisterExternalTool, runShell };
+/** Kills every process started with run_background — called when a front-end exits. */
+function stopAllBackground() {
+  for (const entry of backgroundProcs.values()) {
+    if (entry.exitCode !== null) continue;
+    try {
+      entry.proc.kill();
+    } catch {
+      // already gone
+    }
+  }
+}
+
+module.exports = { stopAllBackground, globToRegExp, findRg, tools, listFiles, toolListForPrompt, apiToolsFor, isToolAvailable, safePath, registerExternalTool, unregisterExternalTool, runShell };

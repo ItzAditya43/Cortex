@@ -23,12 +23,34 @@ function parseToolCall(text) {
 
   let depth = 0;
   let inString = false;
+  let inSingle = false; // inside a '...' string the model wrote instead of "..."
   let escaped = false;
   let end = -1;
   let sanitized = '';
 
   for (let i = start; i < after.length; i++) {
     const ch = after[i];
+    // Small models quote a value that itself contains double quotes with
+    // single quotes: "old_str": '"1.0.0"'. That is not JSON, and the model
+    // resends it unchanged every time it is told so. A quote character can
+    // only appear outside a string in JSON if it starts one, so reading
+    // '...' as a string is unambiguous; it is re-emitted properly escaped.
+    if (inSingle) {
+      if (ch === '\\' && after[i + 1] === "'") {
+        sanitized += "'";
+        i++;
+      } else if (ch === '\\') {
+        sanitized += after[i + 1] !== undefined && '"\\/bfnrtu'.includes(after[i + 1]) ? ch + after[++i] : '\\\\';
+      } else if (ch === "'") {
+        sanitized += '"';
+        inSingle = false;
+      } else if (ch === '"') sanitized += '\\"';
+      else if (ch === '\n') sanitized += '\\n';
+      else if (ch === '\r') sanitized += '\\r';
+      else if (ch === '\t') sanitized += '\\t';
+      else sanitized += ch;
+      continue;
+    }
     if (inString) {
       if (escaped) {
         sanitized += ch;
@@ -71,6 +93,11 @@ function parseToolCall(text) {
     if (ch === '"') {
       inString = true;
       sanitized += ch;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = true;
+      sanitized += '"';
       continue;
     }
     if (ch === '{') depth++;

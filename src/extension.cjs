@@ -468,6 +468,10 @@ function activate(context) {
       if (next === 'Score my models') vscode.commands.executeCommand('cortex.benchmarkModels');
     })
   );
+
+  // For the integration suite, which drives a real turn through the panel's
+  // provider inside the extension host. Not a public API.
+  return { _chatProvider: provider };
 }
 
 function formatSize(bytes) {

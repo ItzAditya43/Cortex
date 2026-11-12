@@ -178,7 +178,8 @@ test('auto picks native only for models that support tools and are big enough to
     assert.strictEqual(await resolveToolMode({ host: small.host, model: 'c' }), 'text', 'small models do better with the text protocol');
     assert.strictEqual(await resolveToolMode({ host: small.host, model: 'c', toolCalling: 'native' }), 'native', 'unless forced');
     assert.strictEqual(await resolveToolMode({ host: withTools.host, model: 'a', toolCalling: 'text' }), 'text');
-    assert.strictEqual(await resolveToolMode({ host: withTools.host, model: 'a', provider: 'openai-compatible' }), 'text');
+    assert.strictEqual(await resolveToolMode({ host: withTools.host, model: 'a', provider: 'openai-compatible' }), 'native', 'openai-compatible servers get function calling');
+    assert.strictEqual(await resolveToolMode({ host: withTools.host, model: 'a', provider: 'openai-compatible', toolCalling: 'text' }), 'text');
   } finally {
     withTools.server.close();
     without.server.close();

@@ -84,8 +84,18 @@ function getStaleWarning(root) {
   );
 }
 
+/** Has the agent read or written this file in this process? */
+function hasSeen(root, relPath) {
+  if (!root || !relPath) return false;
+  const want = path.resolve(root, relPath);
+  for (const key of tracked.keys()) {
+    if (path.resolve(root, key) === want) return true;
+  }
+  return false;
+}
+
 function reset() {
   tracked.clear();
 }
 
-module.exports = { markAgentRead, markAgentWrite, checkStale, getStaleWarning, reset };
+module.exports = { markAgentRead, markAgentWrite, checkStale, getStaleWarning, hasSeen, reset };

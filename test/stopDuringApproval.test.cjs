@@ -25,6 +25,7 @@ test('an approval granted after Stop does not run the tool', async () => {
       history: [{ role: 'user', content: 'make a.txt' }],
       root,
       toolCalling: 'text',
+    contextBudgetTokens: 6000,
       host: 'http://fake',
       model: 'fake',
       temperature: 0,

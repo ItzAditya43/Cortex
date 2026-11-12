@@ -118,4 +118,4 @@ function extractJsonToolCalls(content, toolNames) {
   return calls;
 }
 
-module.exports = { toNativeMessages, synthesizeReply, extractJsonToolCalls };
+module.exports = { toNativeMessages, synthesizeReply, extractJsonToolCalls, splitResults };

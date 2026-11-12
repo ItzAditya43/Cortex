@@ -1,0 +1,10 @@
+test/
+eval/
+.vscode/
+.vscode-test/
+.cortex/
+.github/
+*.vsix
+SMOKE-TEST.md
+tsconfig.json
+node_modules/

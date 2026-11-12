@@ -235,13 +235,27 @@ function parseParamSize(v) {
   return n * { K: 1e-6, M: 1e-3, B: 1, T: 1e3 }[unit];
 }
 
+// Ollama's hosted models are named "<model>:cloud" or "<model>:<size>-cloud".
+function isCloudName(model) {
+  return /(^|[:-])cloud$/i.test(String(model || ''));
+}
+
+// model_info keys are prefixed by architecture ("gemma4.context_length").
+function contextLengthOf(modelInfoObj) {
+  if (!modelInfoObj || typeof modelInfoObj !== 'object') return null;
+  for (const [k, v] of Object.entries(modelInfoObj)) {
+    if (k.endsWith('.context_length') && Number(v) > 0) return Number(v);
+  }
+  return null;
+}
+
 /**
  * What a model can do ("tools", "thinking", "vision", ...) and its size in
  * billions of parameters, from Ollama's /api/show. Cached per host+model;
  * an unreachable server or unknown model yields no capabilities rather than
  * an error.
  * @param {{host: string, model: string}} opts
- * @returns {Promise<{capabilities: string[], paramsB: number|null}>}
+ * @returns {Promise<{capabilities: string[], paramsB: number|null, contextLength: number|null, cloud: boolean}>}
  */
 function modelInfo({ host, model }) {
   const key = `${host}|${model}`;
@@ -256,14 +270,16 @@ function modelInfo({ host, model }) {
       .then((/** @type {any} */ data) => ({
         capabilities: Array.isArray(data?.capabilities) ? data.capabilities : [],
         paramsB: parseParamSize(data?.details?.parameter_size),
+        contextLength: contextLengthOf(data?.model_info),
+        cloud: !!(data?.remote_host || data?.remote_model) || isCloudName(model),
       }))
       .catch(() => {
         capabilityCache.delete(key); // retry next time instead of caching a transient failure
-        return { capabilities: [], paramsB: null };
+        return { capabilities: [], paramsB: null, contextLength: null, cloud: isCloudName(model) };
       });
     capabilityCache.set(key, lookup);
   }
   return capabilityCache.get(key);
 }
 
-module.exports = { chat, listModels, numCtxFor, modelInfo, parseParamSize };
+module.exports = { chat, listModels, numCtxFor, modelInfo, parseParamSize, isCloudName, REPLY_HEADROOM_TOKENS };
