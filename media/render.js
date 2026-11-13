@@ -302,7 +302,63 @@
     return m ? { start: before.length - m[2].length - 1, query: m[2] } : null;
   }
 
+  // ---------- syntax highlighting ----------
+  // A small tokenizer, not a parser: comments, strings, numbers and keywords
+  // are enough to make a code block readable, and it stays dependency-free.
+  const KEYWORDS = new Set(
+    (
+      'abstract as async await break case catch class const continue debugger default def del delete do elif else enum except export extends ' +
+      'false finally fn for from func function global go if impl implements import in instanceof interface is lambda let loop match mod mut ' +
+      'new nil None not null of or package pass private protected pub public raise return self static struct super switch this throw trait ' +
+      'true True False try type typeof undefined use var void while with yield and echo then fi done esac elif local readonly unset'
+    ).split(' ')
+  );
+  const HASH_COMMENT = new Set(['py', 'python', 'sh', 'bash', 'zsh', 'shell', 'yaml', 'yml', 'toml', 'rb', 'ruby', 'dockerfile', 'makefile', 'ini', 'conf', 'r', 'pl']);
+  const NO_HIGHLIGHT = new Set(['', 'text', 'txt', 'plaintext', 'diff', 'log', 'output', 'console', 'markdown', 'md']);
+
+  /**
+   * @param {string} code raw (unescaped) source
+   * @param {string} lang the fence's language tag
+   * @returns {string} HTML
+   */
+  function highlightCode(code, lang) {
+    const l = String(lang || '').toLowerCase();
+    const src = String(code || '');
+    if (NO_HIGHLIGHT.has(l) || src.length > 40000) return escapeHtml(src);
+    const hash = HASH_COMMENT.has(l);
+    const slash = !hash && !['html', 'xml', 'css', 'json'].includes(l);
+    const parts = [];
+    if (slash) parts.push('\\/\\/[^\\n]*', '\\/\\*[\\s\\S]*?(?:\\*\\/|$)');
+    if (hash) parts.push('#[^\\n]*');
+    if (l === 'html' || l === 'xml') parts.push('<!--[\\s\\S]*?(?:-->|$)');
+    const comment = parts.length ? `(${parts.join('|')})` : '($^)';
+    const re = new RegExp(
+      `${comment}|("(?:\\\\.|[^"\\\\\\n])*"?|'(?:\\\\.|[^'\\\\\\n])*'?|\`(?:\\\\.|[^\`\\\\])*\`?)|\\b(\\d[\\d_]*(?:\\.\\d+)?(?:[eE][+-]?\\d+)?|0x[\\da-fA-F]+)\\b|\\b([A-Za-z_$][\\w$]*)\\b`,
+      'g'
+    );
+    let out = '';
+    let last = 0;
+    let m;
+    while ((m = re.exec(src))) {
+      if (m[0] === '') {
+        re.lastIndex++;
+        continue;
+      }
+      out += escapeHtml(src.slice(last, m.index));
+      const t = escapeHtml(m[0]);
+      if (m[1] !== undefined) out += `<span class="hl-c">${t}</span>`;
+      else if (m[2] !== undefined) out += `<span class="hl-s">${t}</span>`;
+      else if (m[3] !== undefined) out += `<span class="hl-n">${t}</span>`;
+      else if (KEYWORDS.has(m[4])) out += `<span class="hl-k">${t}</span>`;
+      else if (src[re.lastIndex] === '(') out += `<span class="hl-f">${t}</span>`;
+      else out += t;
+      last = re.lastIndex;
+    }
+    return out + escapeHtml(src.slice(last));
+  }
+
   root.CortexRender = {
+    highlightCode,
     rankFiles,
     mentionAt,
     escapeHtml,

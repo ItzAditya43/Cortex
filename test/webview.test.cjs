@@ -100,7 +100,7 @@ test('the result of an approved action is shown, with its revert button', () => 
   ui.post({ type: 'toolResult', id: 'c1', result: 'OK: edited a.js', isError: false, revertAvailable: true, diffView: null });
   assert.strictEqual(card.querySelector('.tool-body.result')?.textContent, 'OK: edited a.js');
   assert.ok(card.querySelector('.revert-btn'), 'revert must be offered for an approved edit');
-  assert.strictEqual(card.querySelector('.status').textContent, '✓');
+  assert.strictEqual(card.querySelector('.status').textContent, 'ok');
 });
 
 test('a rejected action does not repeat the decline text as a result', () => {

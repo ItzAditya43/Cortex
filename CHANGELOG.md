@@ -5,6 +5,19 @@ All notable changes to Cortex are documented here.
 ## [0.2.0] — 2026-11-13
 
 ### Added
+- **A redesigned chat panel ("Instrument").** The panel now reads like a
+  control panel rather than a chat app: hairline rules, small-caps labels,
+  status lamps, square corners and one signal colour (amber) on top of the
+  active VS Code theme. A status strip sets mode, approvals and sandbox;
+  each turn is a numbered strip with its total time; each tool call is one
+  line with a lamp, a verb, its target, how long it took and its outcome
+  (a command that exits non-zero shows its exit code); plans are a
+  checklist with progress. The empty panel shows the workspace, branch,
+  changed-file count and recent conversations to resume instead of a
+  greeting. Approvals offer Approve, Reject, Always and Diff. A bar gauge
+  shows context use; a status bar shows steps, tokens, files changed and
+  time. One drawer holds History (searchable, grouped by day, with fork),
+  Settings, Permissions and Memory, and `/` opens a command menu.
 - **A real CLI: `cortex`.** The terminal agent is rebuilt around the same
   engine as the extension: streaming Markdown output, a line per tool call
   with its result, coloured diffs before every edit, and approvals you can

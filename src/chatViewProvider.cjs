@@ -36,15 +36,6 @@ const MUTATING_TOOLS = Object.entries(tools)
   .filter(([, t]) => t.confirm)
   .map(([name]) => name);
 
-// Inline SVG line-icons (feather-icons style) for the topbar buttons — kept
-// as plain vector paths rather than emoji so they render consistently
-// (weight, color, alignment) across OSes instead of relying on the
-// platform's emoji font.
-const ICON_SVG_ATTRS = 'width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"';
-const ICON_MEMORY = `<svg ${ICON_SVG_ATTRS}><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"></path></svg>`;
-const ICON_HISTORY = `<svg ${ICON_SVG_ATTRS}><circle cx="12" cy="12" r="9"></circle><polyline points="12 7 12 12 16 14"></polyline></svg>`;
-const ICON_APPROVALS = `<svg ${ICON_SVG_ATTRS}><polyline points="8 11 11 14 17 6"></polyline><path d="M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"></path></svg>`;
-
 // The chat card's view of a change: hunks per file plus totals. multi_edit
 // snapshots carry one entry per file; everything else is a single file.
 function diffViewFor(change) {
@@ -113,6 +104,34 @@ function simplifyHistoryForDisplay(history) {
   }
   return out;
 }
+
+// Settings the panel's Settings tab may change, with the values each accepts.
+const oneOf = (...vals) => (v) => vals.includes(v);
+const PANEL_SETTINGS = {
+  approvalPolicy: oneOf('untrusted', 'on-request', 'never'),
+  sandboxMode: oneOf('read-only', 'workspace-write', 'danger-full-access'),
+  toolCalling: oneOf('auto', 'native', 'text'),
+  maxSteps: (v) => Number.isInteger(v) && v >= 1 && v <= 500,
+  temperature: (v) => typeof v === 'number' && v >= 0 && v <= 2,
+  testCommand: (v) => typeof v === 'string' && v.length < 500,
+  approveForMe: (v) => typeof v === 'boolean',
+  useTerminal: (v) => typeof v === 'boolean',
+  animateEdits: (v) => typeof v === 'boolean',
+};
+// Commands the panel's buttons may run.
+const PANEL_COMMANDS = [
+  'cortex.selectModel',
+  'cortex.selectProfile',
+  'cortex.showLogs',
+  'cortex.showAuditLog',
+  'cortex.buildCodeIndex',
+  'cortex.benchmarkModels',
+  'cortex.probeModel',
+  'cortex.setup',
+  'cortex.openWalkthrough',
+  'cortex.generateCommitMessage',
+  'cortex.revertLastTurn',
+];
 
 class ChatViewProvider {
   static viewType = 'cortex.chatView';
@@ -216,39 +235,61 @@ class ChatViewProvider {
 </head>
 <body>
 <div id="app">
-  <div id="brand"><span class="brand-dot"></span><span class="brand-name">Cortex</span><span class="brand-tag">local &middot; Ollama-powered</span></div>
-  <div id="topbar">
-    <div id="mode-toggle" role="tablist">
-      <button class="mode-btn active" data-mode="act" role="tab">Act</button>
-      <button class="mode-btn" data-mode="plan" role="tab">Plan</button>
-    </div>
-    <div id="approve-toggle" role="tablist" title="Manual: approve every change. Auto: run without asking.">
-      <button class="approve-btn active" data-approve="manual" role="tab">Manual</button>
-      <button class="approve-btn" data-approve="auto" role="tab">Auto</button>
-    </div>
+  <header id="header">
+    <div id="brand" title="Cortex"><span class="brand-name">Cortex</span><span id="lamp" class="lamp" title="Idle"></span></div>
+    <button id="model-badge" title="Switch model"><span class="model-name">${escapeHtml(cfg.model)}</span></button>
     <span class="spacer"></span>
-    <button id="memory-btn" title="Memory" aria-label="Memory">${ICON_MEMORY}</button>
-    <button id="history-btn" title="History" aria-label="History">${ICON_HISTORY}</button>
-    <button id="approvals-btn" title="Per-action auto-approve" aria-label="Auto-approve settings">${ICON_APPROVALS}</button>
-  </div>
-  <div id="panel-history" class="panel hidden"></div>
-  <div id="panel-approvals" class="panel hidden"></div>
-  <div id="panel-memory" class="panel hidden"></div>
-  <div id="banner" class="hidden"></div>
-  <div id="messages"></div>
-  <button id="jump-bottom" class="hidden" title="Jump to latest">&#8595; Latest</button>
-  <div id="composer">
-    <input type="file" id="image-input" accept="image/*" class="hidden">
-    <textarea id="input" placeholder="Ask Cortex to do something in this workspace..." rows="3"></textarea>
-    <div id="composer-row">
-      <button id="attach-btn" title="Attach an image (vision model required)" aria-label="Attach image">📎</button>
-      <button id="model-badge" title="Switch model">${escapeHtml(cfg.model)}</button>
-      <span id="session-stats" title="This session: tool calls / total time"></span>
-      <span class="spacer"></span>
-      <button id="stop-btn" class="hidden">Stop</button>
-      <button id="send-btn">Send</button>
+    <span id="context-meter" class="hidden" title="Context used"><span class="key">ctx</span><span class="meter-bars"><i></i><i></i><i></i><i></i><i></i></span><span class="meter-label"></span></span>
+    <div class="header-actions">
+      <button class="icon-btn" id="new-chat-btn" title="New chat" aria-label="New chat" data-icon="plus"></button>
+      <button class="icon-btn" id="history-btn" title="History" aria-label="History" data-icon="history"></button>
+      <button class="icon-btn" id="settings-btn" title="Settings and tools" aria-label="Settings" data-icon="sliders"></button>
     </div>
+  </header>
+  <div id="strip">
+    <button class="seg" id="mode-pill" title="Act: make changes. Plan: investigate and propose only."><span class="key">mode</span><span class="pill-label">act</span></button>
+    <button class="seg" id="approve-pill" title="When Cortex asks before changing things"><span class="key">approve</span><span class="pill-label">ask</span></button>
+    <button class="seg" id="sandbox-seg" title="How much a command is allowed to touch"><span class="key">sandbox</span><span class="pill-label">full</span></button>
   </div>
+
+  <div id="banner" class="hidden"></div>
+
+  <main id="messages" aria-live="polite"></main>
+  <button id="jump-bottom" class="hidden" title="Jump to latest" aria-label="Jump to latest">latest &#8595;</button>
+
+  <footer id="composer-wrap">
+    <div id="composer">
+      <input type="file" id="image-input" accept="image/*" class="hidden">
+      <div id="context-row"></div>
+      <div id="prompt-line"><span class="prompt-mark" aria-hidden="true">&#9656;</span><textarea id="input" placeholder="describe a change" rows="1"></textarea></div>
+      <div id="composer-row">
+        <button class="tool-btn" id="attach-btn" title="Attach an image (needs a vision model)" aria-label="Attach image">img</button>
+        <button class="tool-btn" id="mention-btn" title="Mention a file" aria-label="Mention a file">@file</button>
+        <button class="tool-btn" id="slash-btn" title="Commands" aria-label="Commands">/cmd</button>
+        <span class="spacer"></span>
+        <button id="stop-btn" class="hidden" title="Stop (Esc)">Stop</button>
+        <button id="send-btn" title="Send (Enter)">Send</button>
+      </div>
+    </div>
+    <div id="statusbar"><span id="session-stats"></span></div>
+  </footer>
+
+  <div id="scrim" class="hidden"></div>
+  <aside id="drawer" class="hidden" aria-label="Settings and tools">
+    <div class="drawer-head">
+      <div class="drawer-tabs" role="tablist">
+        <button class="drawer-tab" data-tab="history" role="tab">History</button>
+        <button class="drawer-tab" data-tab="settings" role="tab">Settings</button>
+        <button class="drawer-tab" data-tab="approvals" role="tab">Permissions</button>
+        <button class="drawer-tab" data-tab="memory" role="tab">Memory</button>
+      </div>
+      <button class="icon-btn" id="drawer-close" title="Close" aria-label="Close" data-icon="x"></button>
+    </div>
+    <div id="panel-history" class="panel hidden"></div>
+    <div id="panel-settings" class="panel hidden"></div>
+    <div id="panel-approvals" class="panel hidden"></div>
+    <div id="panel-memory" class="panel hidden"></div>
+  </aside>
 </div>
 <script nonce="${nonceVal}" src="${renderUri}"></script>
 <script nonce="${nonceVal}" src="${scriptUri}"></script>
@@ -256,13 +297,89 @@ class ChatViewProvider {
 </html>`;
   }
 
+  // What the panel is allowed to know about the configuration. Never the
+  // API key: the webview has no use for it.
+  publicConfig() {
+    const cfg = this.cfg();
+    const c = vscode.workspace.getConfiguration('cortex');
+    return {
+      model: cfg.model,
+      fastModel: cfg.fastModel,
+      provider: cfg.provider,
+      host: cfg.host,
+      autoApprove: !!cfg.autoApprove,
+      approvalPolicy: cfg.approvalPolicy,
+      sandboxMode: cfg.sandboxMode,
+      maxSteps: cfg.maxSteps,
+      temperature: cfg.temperature,
+      toolCalling: cfg.toolCalling,
+      testCommand: cfg.testCommand,
+      approveForMe: cfg.approveForMe,
+      useTerminal: cfg.useTerminal,
+      animateEdits: c.get('animateEdits') !== false,
+      profiles: Object.keys(c.get('profiles') || {}),
+      activeProfile: this.activeProfile || c.get('activeProfile') || '',
+    };
+  }
+
+  postConfig() {
+    this.post({ type: 'config', ...this.publicConfig() });
+  }
+
+  // What the empty panel shows instead of a greeting: where you are, what
+  // state the repository is in, and what you were last doing here.
+  postWorkspaceInfo() {
+    const root = this.root;
+    if (!root) {
+      this.post({ type: 'workspaceInfo', name: null });
+      return;
+    }
+    const info = { type: 'workspaceInfo', name: require('path').basename(root), branch: null, changed: null, recent: [] };
+    try {
+      info.recent = listSessions(root)
+        .filter((s) => s.id !== this.sessionId)
+        .slice(0, 5);
+    } catch {
+      // no saved sessions
+    }
+    require('child_process').execFile('git', ['status', '--porcelain', '-b'], { cwd: root, timeout: 3000 }, (err, stdout) => {
+      if (!err && stdout) {
+        const lines = stdout.split('\n').filter(Boolean);
+        const head = (lines[0] || '').replace(/^## /, '');
+        info.branch = head.replace(/^No commits yet on /, '').split('...')[0] || null;
+        info.changed = lines.length - 1;
+      }
+      this.post(info);
+    });
+  }
+
+  // The file (and selection) the editor is on, shown as a chip above the
+  // composer so it is clear what "this" refers to before sending.
+  postEditorContext() {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.uri.scheme !== 'file') {
+      this.post({ type: 'editorContext', file: null });
+      return;
+    }
+    const sel = editor.selection;
+    this.post({
+      type: 'editorContext',
+      file: vscode.workspace.asRelativePath(editor.document.uri),
+      selection: sel.isEmpty ? null : { startLine: sel.start.line + 1, endLine: sel.end.line + 1 },
+    });
+  }
+
   async handleMessage(msg) {
     switch (msg.type) {
       case 'ready': {
         const root = this.root;
         this.history = root ? loadHistory(root, this.sessionId) : [];
-        this.post({ type: 'config', ...this.cfg() });
+        this.postConfig();
         this.post({ type: 'mode', mode: this.mode });
+        this.post({ type: 'commands', items: this.slashCommandList() });
+        this.post({ type: 'restoreSession', id: this.sessionId, messages: simplifyHistoryForDisplay(this.history) });
+        this.postEditorContext();
+        this.postWorkspaceInfo();
         this.post({ type: 'autoApproveTools', tools: MUTATING_TOOLS, enabled: this.autoApproveTools });
         // The webview restarts on reload with a fresh, idle UI; the provider
         // may not be idle. Without this the two disagree and the panel shows
@@ -297,7 +414,7 @@ class ChatViewProvider {
         break;
       case 'setProfile':
         this.activeProfile = msg.name || '';
-        this.post({ type: 'config', ...this.cfg() });
+        this.postConfig();
         break;
       case 'openDiff':
         await this.openDiff(msg.diffId);
@@ -316,9 +433,24 @@ class ChatViewProvider {
       case 'setAutoApprove': {
         const c = vscode.workspace.getConfiguration('cortex');
         await c.update('autoApprove', !!msg.enabled, vscode.ConfigurationTarget.Workspace);
-        this.post({ type: 'config', ...this.cfg() });
+        this.postConfig();
         break;
       }
+      case 'setSetting': {
+        // Only the settings the panel offers, each checked against what it may hold.
+        const allowed = PANEL_SETTINGS[msg.key];
+        if (!allowed || !allowed(msg.value)) break;
+        await vscode.workspace.getConfiguration('cortex').update(msg.key, msg.value, vscode.ConfigurationTarget.Global);
+        this.postConfig();
+        break;
+      }
+      case 'runCommand':
+        if (PANEL_COMMANDS.includes(msg.command)) await vscode.commands.executeCommand(msg.command);
+        else if (msg.command === 'openSettings') await vscode.commands.executeCommand('workbench.action.openSettings', '@ext:ItzAditya43.cortex');
+        break;
+      case 'listCommands':
+        this.post({ type: 'commands', items: this.slashCommandList() });
+        break;
       case 'getMemory': {
         const root = this.root;
         this.post({ type: 'memoryContent', content: root ? loadMemoryNotes(root) : '' });
@@ -478,6 +610,7 @@ class ChatViewProvider {
     this.diffShownFor.clear();
     this.checkpoints = [];
     this.post({ type: 'cleared' });
+    this.postWorkspaceInfo();
   }
 
   resolveApproval(id, approved) {
@@ -578,6 +711,17 @@ class ChatViewProvider {
     } catch (err) {
       this.post({ type: 'error', text: `Revert failed: ${err.message}` });
     }
+  }
+
+  slashCommandList() {
+    const builtin = [
+      { name: 'compact', description: 'Summarize the conversation to free up context' },
+      { name: 'init', description: 'Write .cortexrules from this project\'s layout' },
+      { name: 'clear', description: 'Start over, discarding this conversation' },
+      { name: 'help', description: 'Show available commands' },
+    ];
+    const custom = listCustomCommands(this.root || undefined).map((c) => ({ name: c.name, description: c.description || 'Custom command', custom: true }));
+    return [...builtin, ...custom];
   }
 
   // Claude-Code-style slash commands, intercepted before anything reaches
@@ -733,6 +877,7 @@ class ChatViewProvider {
       this.busy = false;
       this.abortController = null;
       this.post({ type: 'busy', value: false });
+      this.postWorkspaceInfo();
     }
   }
 

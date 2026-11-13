@@ -85,10 +85,22 @@ function activate(context) {
     })
   );
 
+  // Keep the panel's "current file" chip in step with the editor.
+  let contextTimer;
+  const refreshEditorContext = () => {
+    clearTimeout(contextTimer);
+    contextTimer = setTimeout(() => provider.postEditorContext(), 120);
+  };
+  context.subscriptions.push(
+    vscode.window.onDidChangeActiveTextEditor(refreshEditorContext),
+    vscode.window.onDidChangeTextEditorSelection(refreshEditorContext),
+    { dispose: () => clearTimeout(contextTimer) }
+  );
+
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   function refreshStatusBar() {
     const model = vscode.workspace.getConfiguration('cortex').get('model');
-    statusBar.text = `$(hubot) Ollama: ${model}`;
+    statusBar.text = `$(hubot) Cortex: ${model}`;
     statusBar.tooltip = 'Cortex — click to open chat';
     statusBar.command = 'cortex.openChat';
     statusBar.show();
@@ -99,9 +111,7 @@ function activate(context) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration('cortex.model')) refreshStatusBar();
-      if (e.affectsConfiguration('cortex.model') || e.affectsConfiguration('cortex.autoApprove')) {
-        provider.post({ type: 'config', ...provider.cfg() });
-      }
+      if (e.affectsConfiguration('cortex')) provider.postConfig();
       if (e.affectsConfiguration('cortex.mcpServers')) {
         const c = vscode.workspace.getConfiguration('cortex');
         startMcpServers(c.get('mcpServers') || [], (m) => logger.log(m));
@@ -221,7 +231,7 @@ function activate(context) {
       });
       if (picked === undefined) return;
       provider.activeProfile = picked.startsWith('(none') ? '' : picked;
-      provider.post({ type: 'config', ...provider.cfg() });
+      provider.postConfig();
       vscode.window.showInformationMessage(`Cortex profile: ${provider.activeProfile || '(none)'}`);
     })
   );

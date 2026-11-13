@@ -85,6 +85,8 @@ function makeMockVscode() {
       showInputBox: async () => undefined,
       withProgress: async (_o, fn) => fn({ report() {} }),
       createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }),
+      onDidChangeActiveTextEditor: () => Disposable,
+      onDidChangeTextEditorSelection: () => Disposable,
       onDidEndTerminalShellExecution: () => Disposable,
       onDidChangeTerminalShellIntegration: () => Disposable,
     },

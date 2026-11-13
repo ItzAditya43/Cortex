@@ -19,6 +19,12 @@ with no API keys or per-token bills — or on any OpenAI-compatible API
 (OpenAI, OpenRouter, Groq, LM Studio, vLLM, llama.cpp). Your code never
 leaves your machine unless you point it at a hosted model.
 
+| | | |
+|---|---|---|
+| ![The chat panel reviewing an edit before it is applied](media/screenshot-chat.png) | ![The settings drawer](media/screenshot-settings.png) | ![The panel in a light theme](media/screenshot-light.png) |
+
+*The VS Code panel, rendered from the extension's own code with sample data: an edit awaiting approval, the settings drawer, and a light theme.*
+
 ## Install
 
 **VS Code:** search for **Cortex Coding Agent** in the Extensions view
